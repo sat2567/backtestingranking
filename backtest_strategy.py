@@ -21,15 +21,15 @@ parser.add_argument("--top-n", dest="top_n", type=int, default=None, help="Overr
 args, _ = parser.parse_known_args()
 
 category_to_csv = {
-    "largecap": "largecap_funds.csv",
-    "smallcap": "smallcap_funds.csv",
-    "midcap": "midcap_funds.csv",
-    "large_and_midcap": "large_and_midcap_funds.csv",
-    "multicap": "multicap_funds.csv",
-    "international": "international_funds.csv",
+    "largecap": "data/largecap_funds.csv",
+    "smallcap": "data/smallcap_funds.csv",
+    "midcap": "data/midcap_funds.csv",
+    "large_and_midcap": "data/large_and_midcap_funds.csv",
+    "multicap": "data/multicap_funds.csv",
+    "international": "data/international_funds.csv",
 }
 
-FUNDS_CSV = args.funds_csv or category_to_csv.get(args.category, "largecap_funds.csv")
+FUNDS_CSV = args.funds_csv or category_to_csv.get(args.category, "data/largecap_funds.csv")
 
 # infer category key from funds csv if user provided a path
 def _infer_key_from_csv(path: str, fallback: str) -> str:
@@ -76,11 +76,11 @@ print(f"Final funds count: {nav_wide.shape[1]}")
 
 # Load benchmark (Nifty 100) and compute daily returns
 print("Loading benchmark (Nifty 100) data...")
-bm_df = pd.read_csv('nifty100_fileter_data.csv')
+bm_df = pd.read_csv('data/nifty100_fileter_data.csv')
 bm_df['Date'] = pd.to_datetime(bm_df['Date'])
 bm_df = bm_df.sort_values('Date')
 bm_df = bm_df.set_index('Date')
-benchmark = bm_df['Close'].astype(float)
+benchmark = bm_df['Close'].astype(str).str.replace(' ', '').astype(float)
 benchmark_returns = benchmark.pct_change().dropna()
 print(f"Benchmark date range: {benchmark_returns.index.min()} to {benchmark_returns.index.max()}")
 
@@ -199,6 +199,11 @@ def compute_metrics_for_date(nav_wide, date_idx, lookback=252):
         # annual return/vol should use ALL available fund data, not aligned subset
         ann_ret = annual_return(fund_returns)
         ann_vol = annual_volatility(fund_returns)
+        # Momentum 6M: annualized return over last 126 days (if available)
+        if len(fund_returns) >= 126:
+            momentum_6m = annual_return(fund_returns.tail(126))
+        else:
+            momentum_6m = np.nan
         # IR/TE/Beta only if we have enough aligned observations and variance
         if len(r_f) >= 20 and r_f.std() > 0 and r_b.std() > 0:
             te = tracking_error(r_a)
@@ -215,6 +220,7 @@ def compute_metrics_for_date(nav_wide, date_idx, lookback=252):
             'mdd': mdd,
             'ann_return': ann_ret,
             'ann_vol': ann_vol,
+            'momentum_6m': momentum_6m,
             'te': te,
             'ir': ir,
             'beta': beta
@@ -361,6 +367,15 @@ for idx, date_idx in enumerate(rebalance_indices):
     # Evaluate selection
     eval_result = evaluate_selection(selected_funds, forward_returns, forward_ranks, TOP_N)
     
+    # Compute benchmark forward return for the same period
+    bench_forward_ret = np.nan
+    if date_idx + HOLDING_PERIOD < len(benchmark):
+        bench_start = benchmark.iloc[date_idx]
+        bench_end = benchmark.iloc[date_idx + HOLDING_PERIOD]
+        bench_forward_ret = (bench_end / bench_start) - 1
+    
+    print(f"  Benchmark forward return: {bench_forward_ret*100:.2f}%" if not np.isnan(bench_forward_ret) else "  Benchmark forward return: N/A")
+    
     print(f"  Overlap accuracy: {eval_result['overlap_accuracy']*100:.1f}%")
     print(f"  Avg rank of selected: {eval_result['avg_rank_of_selected']:.1f}")
     print(f"  Mean future return: {eval_result['mean_future_return']*100:.2f}%")
@@ -374,6 +389,7 @@ for idx, date_idx in enumerate(rebalance_indices):
         'overlap_accuracy': eval_result['overlap_accuracy'],
         'avg_rank_of_selected': eval_result['avg_rank_of_selected'],
         'mean_future_return': eval_result['mean_future_return'],
+        'bench_forward_return': bench_forward_ret,
         'selected_funds': ','.join(map(str, selected_funds)),
         'actual_top_funds': ','.join(map(str, eval_result['actual_top_funds']))
     }
@@ -402,6 +418,7 @@ for idx, date_idx in enumerate(rebalance_indices):
             'mdd': met.get('mdd', np.nan),
             'ann_return': met.get('ann_return', np.nan),
             'ann_vol': met.get('ann_vol', np.nan),
+            'momentum_6m': met.get('momentum_6m', np.nan),
             'beta': met.get('beta', np.nan),
             'te': met.get('te', np.nan),
             'ir': met.get('ir', np.nan),
@@ -422,21 +439,21 @@ print("="*70)
 
 # Summary results
 summary_df = pd.DataFrame(results)
-summary_path = f'backtest_results_summary_{cat_key}.csv'
+summary_path = f'output/backtest_results_summary_{cat_key}.csv'
 summary_df.to_csv(summary_path, index=False)
 print(f"Summary saved: {summary_path} ({len(summary_df)} rebalances)")
 if cat_key == 'largecap':
-    summary_df.to_csv('backtest_results_summary.csv', index=False)
-    print("Summary also saved: backtest_results_summary.csv")
+    summary_df.to_csv('output/backtest_results_summary.csv', index=False)
+    print("Summary also saved: output/backtest_results_summary.csv")
 
 # Detailed results
 detailed_df = pd.DataFrame(detailed_results)
-detailed_path = f'backtest_results_detailed_{cat_key}.csv'
+detailed_path = f'output/backtest_results_detailed_{cat_key}.csv'
 detailed_df.to_csv(detailed_path, index=False)
 print(f"Detailed saved: {detailed_path} ({len(detailed_df)} fund selections)")
 if cat_key == 'largecap':
-    detailed_df.to_csv('backtest_results_detailed.csv', index=False)
-    print("Detailed also saved: backtest_results_detailed.csv")
+    detailed_df.to_csv('output/backtest_results_detailed.csv', index=False)
+    print("Detailed also saved: output/backtest_results_detailed.csv")
 
 # ============================================================================
 # SUMMARY STATISTICS

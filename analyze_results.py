@@ -4,8 +4,8 @@ import numpy as np
 from datetime import datetime
 
 # Load results
-summary = pd.read_csv('backtest_results_summary.csv')
-detailed = pd.read_csv('backtest_results_detailed.csv')
+summary = pd.read_csv('output/backtest_results_summary.csv')
+detailed = pd.read_csv('output/backtest_results_detailed.csv')
 
 # Convert dates
 summary['rebalance_date'] = pd.to_datetime(summary['rebalance_date'])
@@ -197,8 +197,8 @@ ax6.grid(True, alpha=0.3)
 ax6.tick_params(axis='x', rotation=45)
 
 plt.tight_layout()
-plt.savefig('backtest_analysis.png', dpi=300, bbox_inches='tight')
-print("Saved: backtest_analysis.png")
+plt.savefig('output/backtest_analysis.png', dpi=300, bbox_inches='tight')
+print("Saved: output/backtest_analysis.png")
 
 # ============================================================================
 # 10. DETAILED REBALANCE TABLE
