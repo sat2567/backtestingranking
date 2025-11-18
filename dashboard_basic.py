@@ -64,12 +64,11 @@ def calculate_sortino_ratio(returns, risk_free_rate=0.05):
     return sortino
 
 # ============================================================================
-# DATA LOADING FUNCTIONS
+# DATA LOADING
 # ============================================================================
 
 @st.cache_data
 def load_fund_data(category_key: str):
-    """Load and prepare fund NAV data."""
     category_to_csv = {
         "largecap": "data/largecap_funds.csv",
         "smallcap": "data/smallcap_funds.csv",
@@ -88,24 +87,19 @@ def load_fund_data(category_key: str):
     df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y')
     df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
     
-    # Remove duplicates
     df = df.drop_duplicates(subset=['scheme_code', 'date'], keep='last')
     
-    # Pivot to wide format
     nav_wide = df.pivot(index='date', columns='scheme_code', values='nav')
     nav_wide = nav_wide.sort_index()
     
-    # Forward fill missing NAVs (up to 5 days)
     nav_wide = nav_wide.ffill(limit=5)
     
-    # Store scheme names
     scheme_names = df[['scheme_code', 'scheme_name']].drop_duplicates().set_index('scheme_code')['scheme_name'].to_dict()
     
     return nav_wide, scheme_names
 
 @st.cache_data
 def load_nifty_data():
-    """Load Nifty 100 benchmark data."""
     try:
         nifty_df = pd.read_csv('data/nifty100_fileter_data.csv')
         nifty_df['Date'] = pd.to_datetime(nifty_df['Date'])
@@ -116,31 +110,22 @@ def load_nifty_data():
         return None
 
 def calculate_simple_nifty_cagr(nifty_data, start_date, end_date):
-    """Calculate simple CAGR from first to last Nifty price."""
     if nifty_data is None or len(nifty_data) == 0:
         return np.nan, None, None
     
     try:
-        # Find closest dates
         start_idx = nifty_data.index.get_indexer([start_date], method='nearest')[0]
         end_idx = nifty_data.index.get_indexer([end_date], method='nearest')[0]
-        
-        # Use actual available dates
-        if start_idx < 0 or start_idx >= len(nifty_data):
-            start_idx = 0
-        if end_idx < 0 or end_idx >= len(nifty_data):
-            end_idx = len(nifty_data) - 1
         
         initial_nifty = float(nifty_data.iloc[start_idx])
         final_nifty = float(nifty_data.iloc[end_idx])
         
-        if initial_nifty <= 0 or final_nifty <= 0 or np.isnan(initial_nifty) or np.isnan(final_nifty):
+        if initial_nifty <= 0 or final_nifty <= 0:
             return np.nan, None, None
         
         actual_start = nifty_data.index[start_idx]
         actual_end = nifty_data.index[end_idx]
         
-        # Calculate CAGR
         total_days = (actual_end - actual_start).days
         total_years = total_days / 365.25
         
@@ -154,11 +139,10 @@ def calculate_simple_nifty_cagr(nifty_data, start_date, end_date):
         return np.nan, None, None
 
 # ============================================================================
-# SELECTION AND METRIC CALCULATION
+# SELECTION & METRIC CALCULATION
 # ============================================================================
 
 def calculate_metrics_for_date(nav_wide, date_idx, lookback=252):
-    """Calculate Sharpe and Sortino ratios for all funds at a given date."""
     if date_idx < lookback:
         return None
     
@@ -184,7 +168,6 @@ def calculate_metrics_for_date(nav_wide, date_idx, lookback=252):
     return metrics
 
 def calculate_forward_returns(nav_wide, date_idx, holding_period=126):
-    """Calculate forward returns and ranks for all funds."""
     if date_idx + holding_period >= len(nav_wide):
         return None, None
     
@@ -197,7 +180,6 @@ def calculate_forward_returns(nav_wide, date_idx, holding_period=126):
     return forward_returns, forward_ranks
 
 def process_all_selections(nav_wide, top_n=5):
-    """Process all selection dates and calculate metrics."""
     start_idx = LOOKBACK
     end_idx = len(nav_wide) - HOLDING_PERIOD
     
@@ -210,25 +192,19 @@ def process_all_selections(nav_wide, top_n=5):
     for date_idx in selection_indices:
         selection_date = nav_wide.index[date_idx]
         
-        # Calculate metrics
         metrics = calculate_metrics_for_date(nav_wide, date_idx, LOOKBACK)
         if metrics is None:
             continue
         
-        # Calculate forward returns
         forward_returns, forward_ranks = calculate_forward_returns(nav_wide, date_idx, HOLDING_PERIOD)
         if forward_returns is None:
             continue
         
-        # Create DataFrame with metrics
         metrics_df = pd.DataFrame(metrics).T
         metrics_df['forward_return'] = metrics_df.index.map(forward_returns.to_dict())
         metrics_df['forward_rank'] = metrics_df.index.map(forward_ranks.to_dict())
         
-        # Select top N by Sharpe
         sharpe_selected = metrics_df.nlargest(top_n, 'sharpe').index.tolist()
-        
-        # Select top N by Sortino
         sortino_selected = metrics_df.nlargest(top_n, 'sortino').index.tolist()
         
         results.append({
@@ -243,6 +219,51 @@ def process_all_selections(nav_wide, top_n=5):
     
     return results
 
+
+# ============================================================================
+# STRATEGY CAGR FUNCTION (NEW)
+# ============================================================================
+
+def compute_strategy_cagr(selection_results, method="sharpe", top_n=5):
+    """
+    Compounds the 6-month forward returns of selected funds to compute strategy CAGR.
+    """
+    capital = 1.0
+    dates = []
+
+    for result in selection_results:
+        if method == "sharpe":
+            selected_funds = result["sharpe_selected"][:top_n]
+        else:
+            selected_funds = result["sortino_selected"][:top_n]
+
+        forward_returns = result["forward_returns"]
+
+        period_returns = []
+        for fund in selected_funds:
+            if fund in forward_returns.index:
+                period_returns.append(forward_returns[fund])
+
+        if len(period_returns) == 0:
+            continue
+
+        period_return = np.mean(period_returns)
+        capital *= (1 + period_return)
+        dates.append(result["selection_date"])
+
+    if len(dates) < 2:
+        return np.nan
+
+    start_date = dates[0]
+    end_date = dates[-1]
+    years = (end_date - start_date).days / 365.25
+
+    if years <= 0:
+        return np.nan
+
+    cagr = (capital ** (1 / years)) - 1
+    return cagr
+
 # ============================================================================
 # DASHBOARD UI
 # ============================================================================
@@ -251,7 +272,6 @@ def main():
     st.title("📊 Basic Fund Selection Dashboard")
     st.markdown("Detailed Fund Selection")
     
-    # Sidebar
     st.sidebar.header("⚙️ Configuration")
     
     cat_name = st.sidebar.selectbox("Category", list(CATEGORY_MAP.keys()), index=0)
@@ -259,46 +279,67 @@ def main():
     
     top_n = st.sidebar.number_input("Top N Funds", min_value=1, max_value=20, value=DEFAULT_TOP_N, step=1)
     
-    # Load data
     nav_wide, scheme_names = load_fund_data(cat_key)
     
     if nav_wide is None:
-        st.error("❌ Fund data file not found. Please check the data directory.")
+        st.error("❌ Fund data file not found.")
         return
     
     if len(nav_wide) < LOOKBACK + HOLDING_PERIOD:
         st.error("❌ Insufficient data. Need at least 1.5 years of data.")
         return
     
-    # Calculate and display Nifty 100 CAGR
     nifty_data = load_nifty_data()
     if nifty_data is not None and len(nav_wide) > 0:
-        # Determine date range from fund data
-        fund_start_date = nav_wide.index[0]  # First date in fund data
-        fund_end_date = nav_wide.index[-1]    # Last date in fund data
+        fund_start = nav_wide.index[0]
+        fund_end = nav_wide.index[-1]
         
-        nifty_cagr, nifty_start, nifty_end = calculate_simple_nifty_cagr(nifty_data, fund_start_date, fund_end_date)
+        nifty_cagr, nifty_start, nifty_end = calculate_simple_nifty_cagr(nifty_data, fund_start, fund_end)
         
-        if not np.isnan(nifty_cagr) and nifty_start and nifty_end:
+        if not np.isnan(nifty_cagr):
             col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Nifty 100 CAGR", f"{nifty_cagr*100:.2f}%")
-            with col2:
-                st.caption(f"From: {nifty_start.strftime('%Y-%m-%d')}")
-            with col3:
-                st.caption(f"To: {nifty_end.strftime('%Y-%m-%d')}")
-    
+            with col1: st.metric("Nifty 100 CAGR", f"{nifty_cagr*100:.2f}%")
+            with col2: st.caption(f"From: {nifty_start.strftime('%Y-%m-%d')}")
+            with col3: st.caption(f"To: {nifty_end.strftime('%Y-%m-%d')}")
+
     st.markdown("---")
     
-    # Process selections
-    with st.spinner("Calculating metrics and selecting funds..."):
+    with st.spinner("Calculating fund selections..."):
         selection_results = process_all_selections(nav_wide, top_n)
     
     if len(selection_results) == 0:
-        st.error("❌ No selection results generated. Check data availability.")
+        st.error("❌ No selection results generated.")
         return
-    
-    # Detailed view for selected date
+
+    # ============================================================================
+    # DISPLAY STRATEGY CAGR (NEW)
+    # ============================================================================
+
+    sharpe_cagr = compute_strategy_cagr(selection_results, method="sharpe", top_n=top_n)
+    sortino_cagr = compute_strategy_cagr(selection_results, method="sortino", top_n=top_n)
+
+    st.subheader("📈 Overall Strategy CAGR")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if not np.isnan(sharpe_cagr):
+            st.metric("Sharpe Strategy CAGR", f"{sharpe_cagr*100:.2f}%")
+        else:
+            st.warning("Sharpe Strategy CAGR unavailable")
+
+    with col2:
+        if not np.isnan(sortino_cagr):
+            st.metric("Sortino Strategy CAGR", f"{sortino_cagr*100:.2f}%")
+        else:
+            st.warning("Sortino Strategy CAGR unavailable")
+
+    st.markdown("---")
+
+    # ============================================================================
+    # DETAILED SELECTION VIEW
+    # ============================================================================
+
     st.subheader("🔍 Detailed Fund Selection")
     
     dates = [r['selection_date'] for r in selection_results]
@@ -316,17 +357,15 @@ def main():
             sharpe_display = []
             
             for fund in sharpe_funds:
-                if fund in metrics_df.index:
-                    row = metrics_df.loc[fund]
-                    sharpe_display.append({
-                        'Fund Name': scheme_names.get(fund, fund),
-                        'Sharpe Ratio': f"{row['sharpe']:.3f}" if not np.isnan(row['sharpe']) else "N/A",
-                        'Forward Return (%)': f"{row['forward_return']*100:.2f}" if not np.isnan(row['forward_return']) else "N/A",
-                        'Forward Rank': f"{row['forward_rank']:.0f}" if not np.isnan(row['forward_rank']) else "N/A"
-                    })
+                row = metrics_df.loc[fund]
+                sharpe_display.append({
+                    'Fund Name': scheme_names.get(fund, fund),
+                    'Sharpe Ratio': f"{row['sharpe']:.3f}",
+                    'Forward Return (%)': f"{row['forward_return']*100:.2f}",
+                    'Forward Rank': f"{row['forward_rank']:.0f}"
+                })
             
-            if sharpe_display:
-                st.dataframe(pd.DataFrame(sharpe_display), use_container_width=True)
+            st.dataframe(pd.DataFrame(sharpe_display), use_container_width=True)
         
         with col2:
             st.markdown("#### Selected by Sortino Ratio")
@@ -334,17 +373,15 @@ def main():
             sortino_display = []
             
             for fund in sortino_funds:
-                if fund in metrics_df.index:
-                    row = metrics_df.loc[fund]
-                    sortino_display.append({
-                        'Fund Name': scheme_names.get(fund, fund),
-                        'Sortino Ratio': f"{row['sortino']:.3f}" if not np.isnan(row['sortino']) else "N/A",
-                        'Forward Return (%)': f"{row['forward_return']*100:.2f}" if not np.isnan(row['forward_return']) else "N/A",
-                        'Forward Rank': f"{row['forward_rank']:.0f}" if not np.isnan(row['forward_rank']) else "N/A"
-                    })
+                row = metrics_df.loc[fund]
+                sortino_display.append({
+                    'Fund Name': scheme_names.get(fund, fund),
+                    'Sortino Ratio': f"{row['sortino']:.3f}",
+                    'Forward Return (%)': f"{row['forward_return']*100:.2f}",
+                    'Forward Rank': f"{row['forward_rank']:.0f}"
+                })
             
-            if sortino_display:
-                st.dataframe(pd.DataFrame(sortino_display), use_container_width=True)
+            st.dataframe(pd.DataFrame(sortino_display), use_container_width=True)
 
 if __name__ == "__main__":
     main()
