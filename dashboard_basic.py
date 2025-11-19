@@ -243,6 +243,85 @@ def process_all_selections(nav_wide, top_n=5):
     
     return results
 
+def create_six_month_windows(start_date, end_date):
+    """Create non-overlapping 6-month windows for selection and evaluation."""
+    windows = []
+    current = start_date
+    window_id = 1
+    while current < end_date:
+        selection_start = current
+        selection_end = selection_start + pd.DateOffset(months=6)
+        evaluation_start = selection_end
+        evaluation_end = evaluation_start + pd.DateOffset(months=6)
+        
+        if evaluation_end > end_date:
+            evaluation_end = end_date
+        
+        windows.append({
+            'Window ID': window_id,
+            'Selection Start': selection_start.strftime('%Y-%m-%d'),
+            'Selection End': selection_end.strftime('%Y-%m-%d'),
+            'Evaluation Start': evaluation_start.strftime('%Y-%m-%d'),
+            'Evaluation End': evaluation_end.strftime('%Y-%m-%d')
+        })
+        
+        current = evaluation_end
+        window_id += 1
+    
+    return pd.DataFrame(windows)
+
+def simulate_portfolio(selection_results, strategy='sharpe'):
+    """Simulate equally weighted portfolio for selected funds."""
+    portfolio_value = 1.0
+    portfolio_values = []
+    start_date = None
+    end_date = None
+    
+    for result in selection_results:
+        selected_funds = result[f'{strategy}_selected']
+        forward_returns = result['forward_returns']
+        
+        if forward_returns is None or len(selected_funds) == 0:
+            continue
+        
+        # Get returns for selected funds
+        selected_returns = [forward_returns.get(fund, np.nan) for fund in selected_funds]
+        selected_returns = [r for r in selected_returns if not np.isnan(r)]
+        
+        if len(selected_returns) == 0:
+            continue
+        
+        # Average return
+        avg_return = np.mean(selected_returns)
+        
+        # Apply to portfolio
+        portfolio_value *= (1 + avg_return)
+        portfolio_values.append({
+            'date': result['selection_date'],
+            'value': portfolio_value,
+            'avg_return': avg_return
+        })
+        
+        if start_date is None:
+            start_date = result['selection_date']
+        end_date = result['selection_date'] + pd.DateOffset(months=6)
+    
+    return portfolio_value, portfolio_values, start_date, end_date
+
+def calculate_portfolio_cagr(portfolio_value, start_date, end_date):
+    """Calculate CAGR for portfolio."""
+    if portfolio_value <= 0 or start_date is None or end_date is None:
+        return np.nan
+    
+    total_days = (end_date - start_date).days
+    total_years = total_days / 365.25
+    
+    if total_years <= 0:
+        return np.nan
+    
+    cagr = (portfolio_value ** (1 / total_years)) - 1
+    return cagr
+
 # ============================================================================
 # DASHBOARD UI
 # ============================================================================
@@ -297,6 +376,28 @@ def main():
     if len(selection_results) == 0:
         st.error("❌ No selection results generated. Check data availability.")
         return
+    
+    # Calculate portfolio CAGRs
+    sharpe_final_value, _, sharpe_start, sharpe_end = simulate_portfolio(selection_results, 'sharpe')
+    sharpe_cagr = calculate_portfolio_cagr(sharpe_final_value, sharpe_start, sharpe_end)
+    
+    sortino_final_value, _, sortino_start, sortino_end = simulate_portfolio(selection_results, 'sortino')
+    sortino_cagr = calculate_portfolio_cagr(sortino_final_value, sortino_start, sortino_end)
+    
+    st.markdown("### Portfolio Performance (Top 5 Funds, 6-Month Rebalance)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Sharpe Strategy CAGR", f"{sharpe_cagr*100:.2f}%" if not np.isnan(sharpe_cagr) else "N/A")
+    with col2:
+        st.metric("Sortino Strategy CAGR", f"{sortino_cagr*100:.2f}%" if not np.isnan(sortino_cagr) else "N/A")
+    with col3:
+        st.metric("Nifty 100 CAGR", f"{nifty_cagr*100:.2f}%" if not np.isnan(nifty_cagr) else "N/A")
+    
+    st.markdown("#### 6-Month Windows")
+    windows_df = create_six_month_windows(fund_start_date, fund_end_date)
+    st.dataframe(windows_df, use_container_width=True)
+    
+    st.markdown("---")
     
     # Detailed view for selected date
     st.subheader("🔍 Detailed Fund Selection")
