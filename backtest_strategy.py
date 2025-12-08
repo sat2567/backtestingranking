@@ -43,7 +43,7 @@ CATEGORY_MAP = {
 }
 
 # Data locations
-DATA_DIR = r"c:\Users\ab528\OneDrive\Desktop\Largecap\data"
+DATA_DIR = "data"
 FILE_MAPPING = {
     "largecap": "largecap_merged.xlsx",
     "smallcap": "smallcap.xlsx",
