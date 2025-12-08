@@ -341,13 +341,13 @@ def get_category_status():
 
 @st.cache_data
 def load_nifty_data():
-    # Load Nifty 100 data from downloaded CSV file
+    # Load Nifty 100 data from local CSV file
     local_path = os.path.join(DATA_DIR, "nifty100_data.csv")
     
     try:
         if not os.path.exists(local_path):
             st.warning(f"Nifty 100 data not found at: {local_path}")
-            st.info("Run 'python merge_and_download.py' to download Nifty 100 data from Yahoo Finance")
+            st.info("Please ensure the nifty100_data.csv file exists in the data folder.")
             return None
             
         df = pd.read_csv(local_path)
@@ -370,7 +370,7 @@ def load_nifty_data():
         
     except Exception as e:
         st.error(f"Error loading Nifty 100 data: {e}")
-        st.info("Run 'python merge_and_download.py' to download Nifty 100 data from Yahoo Finance")
+        st.info("Please check the nifty100_data.csv file format and ensure it contains 'date' and 'nav' columns.")
         return None
 
 # ============================================================================
