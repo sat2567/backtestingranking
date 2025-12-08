@@ -26,6 +26,10 @@ RISK_FREE_RATE = 0.06              # 6% annual
 EXECUTION_LAG = 1                  # Days between Analysis and Entry (T+1)
 TRADING_DAYS_YEAR = 252            # Standardized trading days in a year
 
+# Data Cleaning Parameters
+MAX_DATA_DATE = pd.Timestamp('2025-12-05')    # Maximum date for data
+LAST_REBALANCE_DATE = pd.Timestamp('2025-05-01')  # Last allowed rebalance date
+
 # Calculate Daily Risk Free Rate (Compounded)
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
 
@@ -38,9 +42,56 @@ CATEGORY_MAP = {
     "International": "international",
 }
 
+# Data locations
+DATA_DIR = r"c:\Users\ab528\OneDrive\Desktop\Largecap\data"
+FILE_MAPPING = {
+    "largecap": "largecap_merged.xlsx",
+    "smallcap": "smallcap.xlsx",
+    "midcap": "midcap.xlsx",
+    "large_and_midcap": "large_and_midcap_fund.xlsx",
+    "multicap": "MULTICAP.xlsx",
+    "international": "international_merged.xlsx",
+}
+
 # ============================================================================
-# 2. HELPER FUNCTIONS (MATH)
+# 2. HELPER FUNCTIONS (DATA CLEANING & MATH)
 # ============================================================================
+
+def clean_weekday_data(df):
+    """
+    Clean data to only include Monday-Friday:
+    1. Keep only weekday data (Monday=0 to Friday=4)
+    2. Remove weekend data (Saturday=5, Sunday=6)
+    3. Forward fill missing weekday data (up to 5 days)
+    4. Filter to max date of Dec 1, 2025
+    """
+    if df is None or df.empty:
+        return df
+    
+    # Filter to max date first
+    df = df[df.index <= MAX_DATA_DATE]
+    
+    # Remove weekend data (Saturday=5, Sunday=6)
+    df = df[df.index.dayofweek < 5]
+    
+    # Create a complete weekday date range
+    if len(df) > 0:
+        start_date = df.index.min()
+        end_date = min(df.index.max(), MAX_DATA_DATE)
+        
+        # Generate all dates in range
+        all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        
+        # Keep only weekdays
+        weekdays = all_dates[all_dates.dayofweek < 5]
+        
+        # Reindex to include all weekdays
+        df = df.reindex(weekdays)
+        
+        # Forward fill missing weekday data (up to 5 trading days)
+        df = df.ffill(limit=5)
+    
+    return df
 
 def calculate_sharpe_ratio(returns):
     """Returns Sharpe Ratio (Higher is Better)"""
@@ -51,10 +102,37 @@ def calculate_sharpe_ratio(returns):
 def calculate_sortino_ratio(returns):
     """Returns Sortino Ratio (Higher is Better)"""
     if len(returns) < 10: return np.nan
-    excess_returns = returns - DAILY_RISK_FREE_RATE
-    downside_returns = returns[returns < 0]
-    if len(downside_returns) < 2 or downside_returns.std() == 0: return np.nan
-    return (excess_returns.mean() / downside_returns.std()) * np.sqrt(TRADING_DAYS_YEAR)
+    downside = returns[returns < 0]
+    if len(downside) == 0: return np.nan
+    downside_std = downside.std()
+    if downside_std == 0: return np.nan
+    mean_return = (returns - DAILY_RISK_FREE_RATE).mean()
+    return (mean_return / downside_std) * np.sqrt(TRADING_DAYS_YEAR)
+
+def calculate_vol_adj_return(series):
+    """Volatility-Adjusted Return (annualized return / annualized volatility)"""
+    if series is None or len(series) < 63:
+        return np.nan
+    cleaned = series.dropna()
+    if len(cleaned) < 63:
+        return np.nan
+    returns = cleaned.pct_change().dropna()
+    if returns.empty:
+        return np.nan
+    total_days = (cleaned.index[-1] - cleaned.index[0]).days
+    if total_days <= 0:
+        return np.nan
+    years = total_days / 365.25
+    if years <= 0:
+        return np.nan
+    start_val, end_val = cleaned.iloc[0], cleaned.iloc[-1]
+    if start_val <= 0 or end_val <= 0:
+        return np.nan
+    annual_return = (end_val / start_val) ** (1 / years) - 1
+    annual_vol = returns.std() * np.sqrt(TRADING_DAYS_YEAR)
+    if annual_vol == 0 or np.isnan(annual_vol):
+        return np.nan
+    return annual_return / annual_vol
 
 def calculate_volatility(returns):
     """Returns Annualized Volatility (Lower is Better)"""
@@ -74,6 +152,54 @@ def calculate_information_ratio(fund_returns, bench_returns):
     
     if tracking_error == 0: return np.nan
     return (active_return.mean() * TRADING_DAYS_YEAR) / tracking_error
+
+def calculate_max_dd(series):
+    """Returns Maximum Drawdown (Lower is Better, as more negative)"""
+    if len(series) < 10 or series.isna().all(): return np.nan
+    cum_returns = (1 + series.pct_change().dropna()).cumprod()
+    running_max = cum_returns.expanding().max()
+    drawdown = (cum_returns - running_max) / running_max
+    return drawdown.min()
+
+def calculate_calmar_ratio(series, analysis_date):
+    """Returns Calmar Ratio (Higher is Better)"""
+    if len(series) < 10 or series.isna().all(): return np.nan
+    start_date = series.index[0]
+    end_val = series.iloc[-1]
+    start_val = series.iloc[0]
+    years = (analysis_date - start_date).days / 365.25
+    if years <= 0 or start_val <= 0: return np.nan
+    cagr = (end_val / start_val) ** (1 / years) - 1
+    max_dd = calculate_max_dd(series)
+    if max_dd >= 0: return np.nan  # No drawdown
+    return cagr / abs(max_dd)
+
+def calculate_beta_alpha_treynor(fund_returns, bench_returns):
+    """Returns Beta, Alpha (annual), Treynor Ratio (Higher Treynor/Alpha Better)"""
+    common_idx = fund_returns.index.intersection(bench_returns.index)
+    if len(common_idx) < 30: return np.nan, np.nan, np.nan
+    
+    f_ret = fund_returns.loc[common_idx]
+    b_ret = bench_returns.loc[common_idx]
+    
+    # Daily excess returns
+    excess_fund = f_ret - DAILY_RISK_FREE_RATE
+    excess_bench = b_ret - DAILY_RISK_FREE_RATE
+    
+    # Covariance matrix
+    cov_matrix = np.cov(excess_fund, excess_bench)
+    beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+    
+    if np.isnan(beta): return np.nan, np.nan, np.nan
+    
+    # Annual excess returns
+    annual_excess_fund = excess_fund.mean() * TRADING_DAYS_YEAR
+    annual_excess_bench = excess_bench.mean() * TRADING_DAYS_YEAR
+    
+    alpha = annual_excess_fund - beta * annual_excess_bench
+    treynor = annual_excess_fund / beta if beta != 0 else np.nan
+    
+    return beta, alpha, treynor
 
 def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False):
     """
@@ -131,54 +257,121 @@ def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False
 # ============================================================================
 
 @st.cache_data
-def load_fund_data(category_key: str):
-    category_to_csv = {
-        "largecap": "data/largecap_funds.csv",
-        "smallcap": "data/smallcap_funds.csv",
-        "midcap": "data/midcap_funds.csv",
-        "large_and_midcap": "data/large_and_midcap_funds.csv",
-        "multicap": "data/multicap_funds.csv",
-        "international": "data/international_funds.csv",
-    }
-    path = category_to_csv.get(category_key)
-    if not os.path.exists(path): return None, None
+def _fetch_fund_data(category_key: str):
+    filename = FILE_MAPPING.get(category_key)
+    if not filename:
+        raise FileNotFoundError(f"No file mapping configured for category: {category_key}")
     
-    try:
-        df = pd.read_csv(path)
-        df.columns = [c.lower().strip() for c in df.columns]
-        if 'scheme_code' in df.columns: df['scheme_code'] = df['scheme_code'].astype(str)
-        
-        # Robust Date Parsing
-        df['date'] = pd.to_datetime(df['date'], errors='coerce', infer_datetime_format=True)
+    local_path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(local_path)
+    
+    # Read Excel file without header (new wide format)
+    df = pd.read_excel(local_path, header=None)
+    
+    # Extract fund names from row 2 (0-indexed), starting from column 1
+    fund_names = df.iloc[2, 1:].tolist()
+    
+    # Data starts from row 4 (0-indexed)
+    data_df = df.iloc[4:, :].copy()
+    
+    # Remove disclaimer row if present
+    if isinstance(data_df.iloc[-1, 0], str) and 'Accord Fintech' in str(data_df.iloc[-1, 0]):
+        data_df = data_df.iloc[:-1, :]
+    
+    # Parse dates
+    dates = pd.to_datetime(data_df.iloc[:, 0], errors='coerce')
+    nav_wide = pd.DataFrame(index=dates)
+    scheme_map = {}
+    
+    for i, fund_name in enumerate(fund_names):
+        if pd.notna(fund_name) and fund_name != '':
+            scheme_code = str(abs(hash(fund_name)) % (10 ** 8))
+            scheme_map[scheme_code] = fund_name
+            nav_values = pd.to_numeric(data_df.iloc[:, i+1], errors='coerce')
+            nav_wide[scheme_code] = nav_values.values
+    
+    nav_wide = nav_wide[nav_wide.index.notna()].sort_index()
+    nav_wide = nav_wide[~nav_wide.index.duplicated(keep='last')]
+    nav_wide = clean_weekday_data(nav_wide)
+    
+    return nav_wide, scheme_map
 
-        df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
-        df = df.dropna(subset=['date', 'nav']) 
-        df = df.sort_values('date').drop_duplicates(subset=['scheme_code', 'date'], keep='last')
-        scheme_map = df[['scheme_code', 'scheme_name']].drop_duplicates('scheme_code').set_index('scheme_code')['scheme_name'].to_dict()
-        nav_wide = df.pivot(index='date', columns='scheme_code', values='nav')
-        
-        # Conservative fill (2 days max)
-        nav_wide = nav_wide.ffill(limit=2) 
-        
-        return nav_wide, scheme_map
+
+def load_fund_data(category_key: str, show_errors: bool = True):
+    try:
+        return _fetch_fund_data(category_key)
+    except FileNotFoundError as e:
+        if show_errors:
+            missing_name = os.path.basename(str(e)) if os.path.isabs(str(e)) else str(e)
+            st.error(f"File not found for '{category_key}' category: {missing_name}")
+            st.info("Ensure the Excel exists under the data folder. For Large Cap run 'python merge_and_download_fixed.py'; for International run 'python merge_international.py'.")
+        return None, None
     except Exception as e:
-        st.error(f"Error loading fund data: {e}"); return None, None
+        if show_errors:
+            st.error(f"Error loading data for '{category_key}': {e}")
+            st.info("Close any open Excel files, rerun the merge scripts, then restart the dashboard.")
+        return None, None
+
+
+@st.cache_data(show_spinner=False)
+def get_category_status():
+    """Return summary info (fund count & last date) for each category."""
+    status_rows = []
+    for display_name, key in CATEGORY_MAP.items():
+        nav_wide, scheme_map = load_fund_data(key, show_errors=False)
+        if nav_wide is not None and not nav_wide.empty:
+            last_date = nav_wide.index.max()
+            status_rows.append({
+                'category': display_name,
+                'key': key,
+                'last_date': last_date,
+                'funds': len(scheme_map),
+                'total_days': len(nav_wide),
+            })
+        else:
+            status_rows.append({
+                'category': display_name,
+                'key': key,
+                'last_date': None,
+                'funds': len(scheme_map) if scheme_map else 0,
+                'total_days': 0,
+            })
+    return status_rows
 
 @st.cache_data
 def load_nifty_data():
-    path = 'data/nifty100_funds.csv'
-    if not os.path.exists(path): return None
+    # Load Nifty 100 data from downloaded CSV file
+    local_path = os.path.join(DATA_DIR, "nifty100_data.csv")
+    
     try:
-        df = pd.read_csv(path)
+        if not os.path.exists(local_path):
+            st.warning(f"Nifty 100 data not found at: {local_path}")
+            st.info("Run 'python merge_and_download.py' to download Nifty 100 data from Yahoo Finance")
+            return None
+            
+        df = pd.read_csv(local_path)
         df.columns = [c.lower().strip() for c in df.columns]
-        if 'close' in df.columns: df = df.rename(columns={'close': 'nav'})
         
-        df['date'] = pd.to_datetime(df['date'], errors='coerce', infer_datetime_format=True)
+        # Handle date parsing
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
         df = df.dropna(subset=['date', 'nav'])
-        return df.set_index('date')['nav'].sort_index()
+        
+        result = df.set_index('date')['nav'].sort_index()
+        
+        # Apply weekday cleaning: remove weekends, forward fill weekdays, filter to Dec 1, 2025
+        result = clean_weekday_data(result.to_frame()).squeeze()
+        
+        if not result.empty:
+            st.sidebar.success(f"📊 Nifty 100: {len(result)} days ({result.index.min().strftime('%Y-%m-%d')} to {result.index.max().strftime('%Y-%m-%d')})")
+        
+        return result
+        
     except Exception as e:
-        st.error(f"Error loading benchmark data: {e}"); return None
+        st.error(f"Error loading Nifty 100 data: {e}")
+        st.info("Run 'python merge_and_download.py' to download Nifty 100 data from Yahoo Finance")
+        return None
 
 # ============================================================================
 # 4. BACKTESTING ENGINE
@@ -204,17 +397,37 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights=No
     except:
         start_idx = 0
         
-    end_idx = len(nav_wide) - holding_days - EXECUTION_LAG
-    
-    if start_idx >= end_idx: return pd.DataFrame(), pd.DataFrame()
+    natural_end_idx = len(nav_wide) - holding_days - EXECUTION_LAG
+    if start_idx >= natural_end_idx:
+        return pd.DataFrame(), pd.DataFrame()
 
-    rebalance_indices = range(start_idx, end_idx, holding_days)
+    # Determine maximum index allowed by LAST_REBALANCE_DATE (pad if exact date missing)
+    max_idx_allowed = nav_wide.index.searchsorted(LAST_REBALANCE_DATE, side='right') - 1
+    max_idx_allowed = min(max_idx_allowed, len(nav_wide) - EXECUTION_LAG - 1)
+    if max_idx_allowed < start_idx:
+        return pd.DataFrame(), pd.DataFrame()
     
-    history, equity_curve = [], [{'date': nav_wide.index[start_idx], 'value': 100.0}]
+    base_end_idx = min(natural_end_idx, max_idx_allowed)
+    if base_end_idx < start_idx:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rebalance_indices = list(range(start_idx, base_end_idx + 1, holding_days))
+    if max_idx_allowed >= start_idx:
+        if not rebalance_indices:
+            rebalance_indices = [max_idx_allowed]
+        elif rebalance_indices[-1] != max_idx_allowed:
+            rebalance_indices.append(max_idx_allowed)
+    rebalance_indices = sorted(set(rebalance_indices))
+    
+    if not rebalance_indices:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    history, equity_curve = [], [{'date': nav_wide.index[rebalance_indices[0]], 'value': 100.0}]
     current_capital = 100.0
     
     for i in rebalance_indices:
         analysis_date = nav_wide.index[i]
+        
         hist_data = get_lookback_data(nav_wide, analysis_date, strategy_type)
         scores = {}
         
@@ -231,6 +444,8 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights=No
                     w12 = momentum_config.get('w_12m', 0)
                     risk_adj = momentum_config.get('risk_adjust', False)
                     val = calculate_flexible_momentum(series, w3, w6, w12, risk_adj)
+                elif strategy_type == 'var':
+                    val = calculate_vol_adj_return(series)
                 else:
                     date_1y_ago = analysis_date - pd.Timedelta(days=365)
                     short_series = series[series.index >= date_1y_ago]
@@ -266,6 +481,15 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights=No
                      if bench_rets is not None and not bench_rets.empty:
                          row['info_ratio'] = calculate_information_ratio(rets, bench_rets)
                 
+                if custom_weights.get('max_dd', 0) > 0: row['max_dd'] = calculate_max_dd(series)
+                if custom_weights.get('calmar', 0) > 0: row['calmar'] = calculate_calmar_ratio(series, analysis_date)
+                
+                if (custom_weights.get('beta', 0) > 0 or custom_weights.get('alpha', 0) > 0 or custom_weights.get('treynor', 0) > 0) and bench_rets is not None and not bench_rets.empty:
+                    beta, alpha, treynor = calculate_beta_alpha_treynor(rets, bench_rets)
+                    if custom_weights.get('beta', 0) > 0: row['beta'] = beta
+                    if custom_weights.get('alpha', 0) > 0: row['alpha'] = alpha
+                    if custom_weights.get('treynor', 0) > 0: row['treynor'] = treynor
+
                 if custom_weights.get('momentum', 0) > 0: 
                     w3 = momentum_config.get('w_3m', 0)
                     w6 = momentum_config.get('w_6m', 0)
@@ -279,12 +503,18 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights=No
                 metrics_df = pd.DataFrame(temp_metrics).set_index('id')
                 final_score_col = pd.Series(0.0, index=metrics_df.index)
                 
-                for metric in ['sharpe', 'sortino', 'momentum', 'info_ratio']:
+                for metric in ['sharpe', 'sortino', 'momentum', 'info_ratio', 'calmar', 'alpha', 'treynor']:
                     if metric in metrics_df.columns:
                         final_score_col = final_score_col.add(metrics_df[metric].rank(pct=True) * custom_weights[metric], fill_value=0)
                 
                 if 'volatility' in metrics_df.columns:
                     final_score_col = final_score_col.add(metrics_df['volatility'].rank(pct=True, ascending=False) * custom_weights['volatility'], fill_value=0)
+                
+                if 'max_dd' in metrics_df.columns:
+                    final_score_col = final_score_col.add(metrics_df['max_dd'].rank(pct=True, ascending=False) * custom_weights['max_dd'], fill_value=0)
+                
+                if 'beta' in metrics_df.columns:
+                    final_score_col = final_score_col.add(metrics_df['beta'].rank(pct=True) * custom_weights['beta'], fill_value=0)
 
                 scores = final_score_col.to_dict()
 
@@ -353,6 +583,8 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
         elif strategy_type == 'momentum':
             w3, w6, w12 = momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m']
             row['Score'] = calculate_flexible_momentum(series, w3, w6, w12, momentum_config['risk_adjust'])
+        elif strategy_type == 'var':
+            row['Score'] = calculate_vol_adj_return(series)
         elif strategy_type == 'custom':
             if custom_weights.get('sharpe',0)>0: row['sharpe'] = calculate_sharpe_ratio(rets)
             if custom_weights.get('sortino',0)>0: row['sortino'] = calculate_sortino_ratio(rets)
@@ -364,6 +596,15 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
 
             if custom_weights.get('info_ratio',0)>0 and bench_rets is not None and not bench_rets.empty: 
                 row['info_ratio'] = calculate_information_ratio(rets, bench_rets)
+            
+            if custom_weights.get('max_dd',0)>0: row['max_dd'] = calculate_max_dd(series)
+            if custom_weights.get('calmar',0)>0: row['calmar'] = calculate_calmar_ratio(series, analysis_date)
+            
+            if (custom_weights.get('beta',0)>0 or custom_weights.get('alpha',0)>0 or custom_weights.get('treynor',0)>0) and bench_rets is not None and not bench_rets.empty:
+                beta, alpha, treynor = calculate_beta_alpha_treynor(rets, bench_rets)
+                if custom_weights.get('beta',0)>0: row['beta'] = beta
+                if custom_weights.get('alpha',0)>0: row['alpha'] = alpha
+                if custom_weights.get('treynor',0)>0: row['treynor'] = treynor
         
         # --- FORWARD RETURN (NO TAX) ---
         raw_ret = np.nan
@@ -386,11 +627,15 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
     # --- RANKING ---
     if strategy_type == 'custom':
         df['Score'] = 0.0
-        for metric in ['sharpe', 'sortino', 'momentum', 'info_ratio']:
+        for metric in ['sharpe', 'sortino', 'momentum', 'info_ratio', 'calmar', 'alpha', 'treynor']:
             if metric in df.columns:
                 df['Score'] = df['Score'].add(df[metric].rank(pct=True) * custom_weights[metric], fill_value=0)
         if 'volatility' in df.columns:
              df['Score'] = df['Score'].add(df['volatility'].rank(pct=True, ascending=False) * custom_weights['volatility'], fill_value=0)
+        if 'max_dd' in df.columns:
+             df['Score'] = df['Score'].add(df['max_dd'].rank(pct=True, ascending=False) * custom_weights['max_dd'], fill_value=0)
+        if 'beta' in df.columns:
+             df['Score'] = df['Score'].add(df['beta'].rank(pct=True) * custom_weights['beta'], fill_value=0)
 
     df['Strategy Rank'] = df['Score'].rank(ascending=False, method='min')
     
@@ -406,8 +651,18 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
 def main():
     st.title("📊 Fund Analysis: Custom & Standard Strategies")
     
+    # Data Cleaning Info
+    st.info(f"📅 **Data Range:** Weekdays only (Monday-Friday) till {MAX_DATA_DATE.strftime('%B %d, %Y')} | **Last Rebalance:** {LAST_REBALANCE_DATE.strftime('%B %d, %Y')}")
+    status_data = pd.DataFrame(get_category_status())
+    
     # --- Sidebar ---
     st.sidebar.header("⚙️ General Settings")
+    if not status_data.empty:
+        with st.sidebar.expander("📅 Data Availability", expanded=False):
+            display_df = status_data[['category', 'last_date', 'funds']].copy()
+            display_df['last_date'] = display_df['last_date'].apply(lambda d: d.strftime('%Y-%m-%d') if pd.notna(d) else 'Missing')
+            display_df = display_df.rename(columns={'category': 'Category', 'last_date': 'Last Date', 'funds': '# Funds'})
+            st.table(display_df)
     cat_key = CATEGORY_MAP[st.sidebar.selectbox("Category", list(CATEGORY_MAP.keys()))]
     
     col_s1, col_s2 = st.sidebar.columns(2)
@@ -509,7 +764,7 @@ def main():
                 )
 
     # --- Tabs ---
-    tab_mom, tab_sharpe, tab_custom = st.tabs(["🚀 Momentum Strategy", "⚖️ Sharpe Ratio", "🛠️ Custom Strategy"])
+    tab_mom, tab_sharpe, tab_var, tab_custom = st.tabs(["🚀 Momentum Strategy", "⚖️ Sharpe Ratio", "📉 VAR Strategy", "🛠️ Custom Strategy"])
 
     with tab_mom:
         st.info(f"Momentum Weights: 3M={momentum_config['w_3m']:.2f}, 6M={momentum_config['w_6m']:.2f}, 1Y={momentum_config['w_12m']:.2f}. Risk Adjust: {momentum_config['risk_adjust']}")
@@ -518,6 +773,10 @@ def main():
     with tab_sharpe:
         display_strategy_results('sharpe')
 
+    with tab_var:
+        st.info("Ranks funds by Volatility-Adjusted Return (annualized return divided by annualized volatility over the last year). Higher is better.")
+        display_strategy_results('var')
+
     with tab_custom:
         with st.form("custom_strat_form"):
             col_c1, col_c2, col_c3 = st.columns(3)
@@ -525,16 +784,26 @@ def main():
             w_sortino = col_c2.slider("Sortino Weight", 0, 100, 0, 10)
             w_mom = col_c3.slider("Momentum Weight", 0, 100, 50, 10)
             
-            col_c4, col_c5 = st.columns(2)
+            col_c4, col_c5, col_c6 = st.columns(3)
             w_vol = col_c4.slider("Low Volatility Weight", 0, 100, 0, 10)
             w_ir = col_c5.slider("Info Ratio Weight", 0, 100, 0, 10)
+            w_maxdd = col_c6.slider("Low MaxDD Weight", 0, 100, 0, 10)
+            
+            col_c7, col_c8, col_c9 = st.columns(3)
+            w_calmar = col_c7.slider("Calmar Ratio Weight", 0, 100, 0, 10)
+            w_beta = col_c8.slider("Beta Weight", 0, 100, 0, 10)
+            w_alpha = col_c9.slider("Alpha Weight", 0, 100, 0, 10)
+            
+            col_c10, col_c11 = st.columns(2)
+            w_treynor = col_c10.slider("Treynor Ratio Weight", 0, 100, 0, 10)
             
             submit_btn = st.form_submit_button("🚀 Run Custom Strategy")
 
         if submit_btn:
             weights = {
                 'sharpe': w_sharpe/100, 'sortino': w_sortino/100, 'momentum': w_mom/100,
-                'volatility': w_vol/100, 'info_ratio': w_ir/100
+                'volatility': w_vol/100, 'info_ratio': w_ir/100, 'max_dd': w_maxdd/100,
+                'calmar': w_calmar/100, 'beta': w_beta/100, 'alpha': w_alpha/100, 'treynor': w_treynor/100
             }
             if sum(weights.values()) == 0: st.error("Select at least one weight > 0")
             else:

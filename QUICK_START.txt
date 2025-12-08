@@ -1,0 +1,56 @@
+═══════════════════════════════════════════════════════════════
+QUICK START GUIDE - Fund Analysis Dashboard Update
+═══════════════════════════════════════════════════════════════
+
+✅ COMPLETED UPDATES:
+• Merged LARGECAP_1.xlsx + LARGECAP_FUND_2.xlsx
+• Added Multi Cap category
+• Updated code to download Nifty 100 from Yahoo Finance (from 2006-01-01)
+• Dashboard ready to use merged data
+
+═══════════════════════════════════════════════════════════════
+NEXT STEPS - PLEASE FOLLOW IN ORDER:
+═══════════════════════════════════════════════════════════════
+
+1️⃣  CLOSE ALL EXCEL FILES
+   → Close any Excel files in the data folder
+   → This prevents "Permission denied" errors
+
+2️⃣  RUN THE MERGE SCRIPT
+   → Open terminal/command prompt
+   → Navigate to: C:\Users\ab528\OneDrive\Desktop\Largecap
+   → Run: python merge_and_download.py
+   → Wait for completion (creates largecap_merged.xlsx and nifty100_data.csv)
+
+3️⃣  START THE DASHBOARD
+   → In the same terminal, run: streamlit run backtest_strategy.py
+   → Dashboard will open in your browser
+
+═══════════════════════════════════════════════════════════════
+NEW FEATURES:
+═══════════════════════════════════════════════════════════════
+
+📊 Categories Available:
+   • Large Cap (merged from 2 files - more funds!)
+   • Small Cap
+   • Mid Cap
+   • Large & Mid Cap
+   • Multi Cap ⭐ NEW
+
+📈 Benchmark:
+   • Nifty 100 data from Yahoo Finance
+   • Historical data from Jan 1, 2006
+   • Auto-updated when you run merge script
+
+═══════════════════════════════════════════════════════════════
+FILES CREATED:
+═══════════════════════════════════════════════════════════════
+
+✓ merge_and_download.py        → Script to merge and download data
+✓ SETUP_INSTRUCTIONS.md         → Detailed instructions
+✓ QUICK_START.txt              → This file
+✓ backtest_strategy.py          → Updated dashboard code
+
+═══════════════════════════════════════════════════════════════
+
+READY TO GO! Follow steps 1-3 above to start using the dashboard.
