@@ -44,6 +44,7 @@ FILE_MAPPING = {
 # ============================================================================
 
 def clean_weekday_data(df):
+    """Ensures data is Mon-Fri and forward filled."""
     if df is None or df.empty: return df
     df = df[df.index <= MAX_DATA_DATE]
     df = df[df.index.dayofweek < 5] # Remove weekends
@@ -493,30 +494,30 @@ def render_explorer_tab():
 # 5. BACKTESTER LOGIC (UPDATED WITH NEW STRATEGIES)
 # ============================================================================
 
-def get_lookback_data(nav_wide, analysis_date):
+def get_lookback_data(nav, analysis_date):
     max_days = 400 
     start_date = analysis_date - pd.Timedelta(days=max_days)
-    return nav_wide[(nav_wide.index >= start_date) & (nav_wide.index < analysis_date)]
+    return nav[(nav.index >= start_date) & (nav.index < analysis_date)]
 
-def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
+def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
     
     # --- 1. DYNAMIC TIMELINE HANDLING ---
-    start_date = nav_wide.index.min() + pd.Timedelta(days=370)
-    if start_date >= nav_wide.index.max(): 
+    start_date = nav.index.min() + pd.Timedelta(days=370)
+    if start_date >= nav.index.max(): 
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         
-    start_idx = nav_wide.index.searchsorted(start_date)
+    start_idx = nav.index.searchsorted(start_date)
     # Loop until end of data - 1 day to allow at least 1 day trade
-    rebal_idx = list(range(start_idx, len(nav_wide) - 1, holding_days))
+    rebal_idx = list(range(start_idx, len(nav) - 1, holding_days))
     
     if not rebal_idx: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
-    history, eq_curve, bench_curve = [], [{'date': nav_wide.index[rebal_idx[0]], 'value': 100.0}], [{'date': nav_wide.index[rebal_idx[0]], 'value': 100.0}]
+    history, eq_curve, bench_curve = [], [{'date': nav.index[rebal_idx[0]], 'value': 100.0}], [{'date': nav.index[rebal_idx[0]], 'value': 100.0}]
     cap, b_cap = 100.0, 100.0
     
     for i in rebal_idx:
-        date = nav_wide.index[i]
-        hist = get_lookback_data(nav_wide, date)
+        date = nav.index[i]
+        hist = get_lookback_data(nav, date)
         
         bench_rets = None
         if benchmark_series is not None:
@@ -534,7 +535,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
         # A. RESIDUAL MOMENTUM
         if strategy_type == 'residual_momentum':
             if benchmark_series is not None:
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126:
                         # Pass raw price series slice of benchmark
@@ -547,7 +548,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
         elif strategy_type == 'stable_momentum':
             # Pass 1: Broad Pool by Momentum (6M + 12M)
             mom_scores = {}
-            for col in nav_wide.columns:
+            for col in nav.columns:
                 s = hist[col].dropna()
                 if len(s) >= 260:
                     # Simple Momentum (3M + 6M + 12M)
@@ -570,7 +571,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
                 regime = get_market_regime(benchmark_series, date)
                 regime_status = regime
                 
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) < 126: continue
                     val = np.nan
@@ -587,7 +588,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
 
         # D. ENSEMBLE (Existing)
         elif strategy_type == 'ensemble':
-            fund_ranks = pd.DataFrame(index=nav_wide.columns)
+            fund_ranks = pd.DataFrame(index=nav.columns)
             
             def dict_to_norm_rank(s_dict):
                 if not s_dict: return pd.Series(0, index=fund_ranks.index)
@@ -598,56 +599,56 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
             # --- Calculate Components based on Weights ---
             if ensemble_weights.get('momentum', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 70: temp[col] = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
                 fund_ranks['momentum'] = dict_to_norm_rank(temp)
 
             if ensemble_weights.get('sharpe', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126: temp[col] = calculate_sharpe_ratio(s.pct_change().dropna())
                 fund_ranks['sharpe'] = dict_to_norm_rank(temp)
                 
             if ensemble_weights.get('martin', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126: temp[col] = calculate_martin_ratio(s)
                 fund_ranks['martin'] = dict_to_norm_rank(temp)
 
             if ensemble_weights.get('omega', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126: temp[col] = calculate_omega_ratio(s.pct_change().dropna())
                 fund_ranks['omega'] = dict_to_norm_rank(temp)
                 
             if ensemble_weights.get('capture', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126 and bench_rets is not None: temp[col] = calculate_capture_score(s.pct_change().dropna(), bench_rets)
                 fund_ranks['capture'] = dict_to_norm_rank(temp)
                 
             if ensemble_weights.get('sortino', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126: temp[col] = calculate_sortino_ratio(s.pct_change().dropna())
                 fund_ranks['sortino'] = dict_to_norm_rank(temp)
             
             if ensemble_weights.get('var', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126: temp[col] = calculate_vol_adj_return(s)
                 fund_ranks['var'] = dict_to_norm_rank(temp)
 
             if ensemble_weights.get('consistent_alpha', 0) > 0:
                 temp = {}
-                for col in nav_wide.columns:
+                for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 252:
                          wr = calculate_rolling_win_rate(s, benchmark_series.loc[:date]) if benchmark_series is not None else 0.5
@@ -668,7 +669,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
         # E. CONSISTENT ALPHA
         elif strategy_type == 'consistent_alpha':
             temp_rows = []
-            for col in nav_wide.columns:
+            for col in nav.columns:
                 s = hist[col].dropna()
                 if len(s) < 252: continue
                 wr = calculate_rolling_win_rate(s, benchmark_series.loc[:date]) if benchmark_series is not None else 0.5
@@ -683,7 +684,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
 
         # F. SINGLE METRICS (Martin, Omega, Sharpe, etc.)
         elif strategy_type in ['martin', 'omega', 'capture_ratio', 'info_ratio', 'momentum', 'sharpe', 'sortino', 'var']:
-             for col in nav_wide.columns:
+             for col in nav.columns:
                 s = hist[col].dropna()
                 if len(s) < 126: continue
                 val = np.nan
@@ -705,7 +706,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
         elif strategy_type == 'custom':
              # (Existing custom logic)
              temp_data = []
-             for col in nav_wide.columns:
+             for col in nav.columns:
                 s = hist[col].dropna()
                 if len(s) < 126: continue
                 rets = s.pct_change().dropna()
@@ -739,12 +740,12 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
 
         # --- EXECUTION ---
         entry_i = i + 1
-        exit_i = min(i + 1 + holding_days, len(nav_wide)-1)
+        exit_i = min(i + 1 + holding_days, len(nav)-1)
         
         # 1. ALWAYS Calculate Benchmark Return for this period
         b_ret = 0.0
         if benchmark_series is not None:
-             try: b_ret = (benchmark_series.asof(nav_wide.index[exit_i]) / benchmark_series.asof(nav_wide.index[entry_i])) - 1
+             try: b_ret = (benchmark_series.asof(nav.index[exit_i]) / benchmark_series.asof(nav.index[entry_i])) - 1
              except: pass
         
         # 2. Portfolio Return
@@ -753,7 +754,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
         
         if selected:
             # If strategy found funds, calculate their return
-            period_ret_all_funds = (nav_wide.iloc[exit_i] / nav_wide.iloc[entry_i]) - 1
+            period_ret_all_funds = (nav.iloc[exit_i] / nav.iloc[entry_i]) - 1
             port_ret = period_ret_all_funds[selected].mean()
             
             actual_top_n_funds = period_ret_all_funds.dropna().nlargest(top_n).index.tolist()
