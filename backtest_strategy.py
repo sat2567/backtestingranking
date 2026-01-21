@@ -22,8 +22,8 @@ st.set_page_config(
 
 # --- Constants ---
 DEFAULT_HOLDING = 126
-DEFAULT_TOP_N = 2       # Default set to 2
-DEFAULT_TARGET_N = 4    # Default set to 4
+DEFAULT_TOP_N = 2
+DEFAULT_TARGET_N = 4
 RISK_FREE_RATE = 0.06
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
@@ -41,14 +41,13 @@ FILE_MAPPING = {
 }
 
 # ============================================================================
-# 2. HELPER FUNCTIONS: DATA CLEANING & MATH
+# 2. HELPER FUNCTIONS
 # ============================================================================
 
 def clean_weekday_data(df):
-    """Ensures data is Mon-Fri and forward filled."""
     if df is None or df.empty: return df
     df = df[df.index <= MAX_DATA_DATE]
-    df = df[df.index.dayofweek < 5] # Remove weekends
+    df = df[df.index.dayofweek < 5] 
     if len(df) > 0:
         start_date = df.index.min()
         end_date = min(df.index.max(), MAX_DATA_DATE)
@@ -119,18 +118,6 @@ def calculate_max_dd(series):
     dd = (comp_ret / peak) - 1
     return dd.min()
 
-def calculate_calmar_ratio(series, analysis_date):
-    if len(series) < 10: return np.nan
-    start_date = series.index[0]
-    end_val = series.iloc[-1]
-    start_val = series.iloc[0]
-    years = (analysis_date - start_date).days / 365.25
-    if years <= 0 or start_val <= 0: return np.nan
-    cagr = (end_val / start_val) ** (1 / years) - 1
-    max_dd = calculate_max_dd(series)
-    if max_dd >= 0: return np.nan 
-    return cagr / abs(max_dd)
-
 def calculate_vol_adj_return(series):
     if series is None or len(series) < 63: return np.nan
     cleaned = series.dropna()
@@ -177,22 +164,6 @@ def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False
         return raw_score / vol
     return raw_score
 
-def calculate_beta_alpha_treynor(fund_returns, bench_returns):
-    common_idx = fund_returns.index.intersection(bench_returns.index)
-    if len(common_idx) < 30: return np.nan, np.nan, np.nan
-    f_ret = fund_returns.loc[common_idx]
-    b_ret = bench_returns.loc[common_idx]
-    excess_fund = f_ret - DAILY_RISK_FREE_RATE
-    excess_bench = b_ret - DAILY_RISK_FREE_RATE
-    cov_matrix = np.cov(excess_fund, excess_bench)
-    beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
-    if np.isnan(beta): return np.nan, np.nan, np.nan
-    annual_excess_fund = excess_fund.mean() * TRADING_DAYS_YEAR
-    annual_excess_bench = excess_bench.mean() * TRADING_DAYS_YEAR
-    alpha = annual_excess_fund - beta * annual_excess_bench
-    treynor = annual_excess_fund / beta if beta != 0 else np.nan
-    return beta, alpha, treynor
-
 def calculate_information_ratio(fund_returns, bench_returns):
     common_idx = fund_returns.index.intersection(bench_returns.index)
     if len(common_idx) < 30: return np.nan
@@ -216,28 +187,38 @@ def calculate_rolling_win_rate(fund_series, bench_series, window=252):
     wins = (f_roll.loc[common_roll] > b_roll.loc[common_roll]).sum()
     return wins / len(common_roll)
 
-# --- NEW QUANT FUNCTIONS ---
+# --- NEW QUANT FUNCTIONS (FIXED) ---
 
 def calculate_residual_momentum(series, benchmark_series):
-    """Calculates Idiosyncratic Momentum (Pure Alpha Trend)."""
-    common_idx = series.index.intersection(benchmark_series.index)
-    if len(common_idx) < 60: return np.nan
+    """
+    Calculates Idiosyncratic Momentum (Pure Alpha Trend).
+    FIXED: Stricter data alignment to prevent noise.
+    """
+    # 1. Clean Data
+    s_ret = series.pct_change().dropna()
+    b_ret = benchmark_series.pct_change().dropna()
     
-    y = series.loc[common_idx].pct_change().dropna()
-    x = benchmark_series.loc[common_idx].pct_change().dropna()
+    # 2. Strict Alignment (Inner Join)
+    aligned_data = pd.concat([s_ret, b_ret], axis=1, join='inner').dropna()
     
-    common_final = y.index.intersection(x.index)
-    if len(common_final) < 30: return np.nan
-    y = y.loc[common_final]
-    x = x.loc[common_final]
+    # 3. Check for sufficient history (at least 60 trading days = ~3 months)
+    if len(aligned_data) < 60: return np.nan
     
+    y = aligned_data.iloc[:, 0] # Fund Returns
+    x = aligned_data.iloc[:, 1] # Bench Returns
+    
+    # 4. Regression
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
+    
+    # 5. Residuals (Actual - Predicted)
     expected_return = (x * slope) + intercept
     residuals = y - expected_return
     
-    # Score = Information Ratio of Residuals
-    if residuals.std() == 0: return 0
-    return residuals.mean() / residuals.std()
+    # 6. Score: Information Ratio of Residuals
+    res_std = residuals.std()
+    if res_std == 0: return 0
+    
+    return residuals.mean() / res_std
 
 def get_market_regime(benchmark_series, current_date, window=200):
     """Determines if Market is Bull (Price > 200 DMA) or Bear."""
@@ -302,8 +283,6 @@ def calculate_analytics_metrics(nav_df, scheme_map, benchmark_series=None):
     
     bench_rolling_1y = benchmark_series.pct_change(252).dropna()
     bench_daily = benchmark_series.pct_change().dropna()
-    bench_monthly = benchmark_series.resample('M').last().pct_change().dropna()
-    bench_quarterly = benchmark_series.resample('Q').last().pct_change().dropna()
     
     b_comp = (1 + bench_daily).cumprod()
     b_peak = b_comp.expanding(min_periods=1).max()
@@ -327,20 +306,8 @@ def calculate_analytics_metrics(nav_df, scheme_map, benchmark_series=None):
         
         diff = f_r - b_r
         beats = diff[diff > 0]
-        losses = diff[diff <= 0]
-        
         perc_times_beated = (len(beats) / len(diff)) * 100
         beated_by_percent_avg = beats.mean() * 100 if not beats.empty else 0
-        lost_by_percent_avg = losses.mean() * 100 if not losses.empty else 0
-        
-        beated_by_percent_max = beats.max() * 100 if not beats.empty else 0
-        beated_by_percent_min = beats.min() * 100 if not beats.empty else 0
-        lost_by_percent_max = losses.min() * 100 if not losses.empty else 0
-        lost_by_percent_min = losses.max() * 100 if not losses.empty else 0
-        
-        win_rate = perc_times_beated / 100
-        loss_rate = 1 - win_rate
-        wtd_avg_out = (win_rate * beated_by_percent_avg) + (loss_rate * lost_by_percent_avg)
         
         daily_ret = series.pct_change().dropna()
         comp = (1 + daily_ret).cumprod()
@@ -348,68 +315,18 @@ def calculate_analytics_metrics(nav_df, scheme_map, benchmark_series=None):
         fund_dd = (comp / peak) - 1
         max_drawdown = fund_dd.min() * 100
         
-        common_dd_idx = fund_dd.index.intersection(bench_dd.index)
-        if len(common_dd_idx) > 10:
-            f_dd = fund_dd.loc[common_dd_idx]
-            b_dd = bench_dd.loc[common_dd_idx]
-            dd_diff = f_dd - b_dd 
-            less_dd = dd_diff[dd_diff > 0]
-            more_dd = dd_diff[dd_diff < 0]
-            
-            perc_times_dd_less = (len(less_dd) / len(dd_diff)) * 100
-            dd_less_by_percent_avg = less_dd.mean() * 100 if not less_dd.empty else 0
-            dd_greater_by_percent_avg = more_dd.mean() * 100 if not more_dd.empty else 0
-            dd_greater_max = more_dd.min() * 100 if not more_dd.empty else 0
-            dd_less_min = less_dd.min() * 100 if not less_dd.empty else 0
-        else:
-            perc_times_dd_less, dd_less_by_percent_avg, dd_greater_by_percent_avg = 0,0,0
-            dd_greater_max, dd_less_min = 0,0
-            
-        common_daily = daily_ret.index.intersection(bench_daily.index)
-        daily_corr = daily_ret.loc[common_daily].corr(bench_daily.loc[common_daily]) if len(common_daily)>10 else np.nan
-        
-        fund_monthly = series.resample('M').last().pct_change().dropna()
-        common_monthly = fund_monthly.index.intersection(bench_monthly.index)
-        monthly_corr = fund_monthly.loc[common_monthly].corr(bench_monthly.loc[common_monthly]) if len(common_monthly)>5 else np.nan
-        
-        fund_quarterly = series.resample('Q').last().pct_change().dropna()
-        common_quarterly = fund_quarterly.index.intersection(bench_quarterly.index)
-        quart_corr = fund_quarterly.loc[common_quarterly].corr(bench_quarterly.loc[common_quarterly]) if len(common_quarterly)>3 else np.nan
-
         metrics.append({
             'fund_name': scheme_map.get(col, col),
             'percent_rolling_avg': percent_rolling_avg,
-            'beated_by_percent_avg': beated_by_percent_avg,
-            'lost_by_percent_avg': lost_by_percent_avg,
             'perc_times_beated': perc_times_beated,
-            'beated_by_percent_max': beated_by_percent_max,
-            'beated_by_percent_min': beated_by_percent_min,
-            'lost_by_percent_max': lost_by_percent_max,
-            'lost_by_percent_min': lost_by_percent_min,
-            'Wtd_avg_outperformance': wtd_avg_out,
-            'MaxDrawdown': max_drawdown,
-            'dd_less_by_percent_avg': dd_less_by_percent_avg,
-            'dd_greater_by_percent_avg': dd_greater_by_percent_avg,
-            'perc_times_dd_less': perc_times_dd_less,
-            'dd_greater_max': dd_greater_max,
-            'dd_less_min': dd_less_min,
-            'Daily_Return_Corr': daily_corr,
-            'Monthly_Return_Corr': monthly_corr,
-            'Quaterly_Return_Corr': quart_corr
+            'beated_by_percent_avg': beated_by_percent_avg,
+            'MaxDrawdown': max_drawdown
         })
         
     df = pd.DataFrame(metrics)
     if not df.empty:
         df['return_rank'] = df['percent_rolling_avg'].rank(ascending=False, method='min')
-        cols = [
-            'return_rank', 'fund_name', 'percent_rolling_avg', 'Wtd_avg_outperformance',
-            'perc_times_beated', 'beated_by_percent_avg', 'lost_by_percent_avg',
-            'MaxDrawdown', 'perc_times_dd_less', 'dd_less_by_percent_avg',
-            'Daily_Return_Corr', 'Monthly_Return_Corr', 'Quaterly_Return_Corr'
-        ]
-        remaining = [c for c in df.columns if c not in cols]
-        df = df[cols + remaining].sort_values('return_rank')
-        
+        return df.sort_values('return_rank')
     return df
 
 def calculate_quarterly_ranks(nav_df, scheme_map):
@@ -455,38 +372,7 @@ def render_explorer_tab():
             if view == "Performance Metrics":
                 nifty = load_nifty_data()
                 df = calculate_analytics_metrics(nav, maps, nifty)
-                
-                column_configuration = {
-                    "fund_name": st.column_config.TextColumn("Fund Name", help="Name of the mutual fund scheme."),
-                    "return_rank": st.column_config.NumberColumn("Rank", help="The fund's rank based purely on returns (1 is best).", format="%d"),
-                    "percent_rolling_avg": st.column_config.NumberColumn("Rolling Avg %", help="The average return of the fund calculated on a rolling basis.", format="%.2f%%"),
-                    "Wtd_avg_outperformance": st.column_config.NumberColumn("Wtd Avg Outperf", help="Weighted Average Outperformance.", format="%.2f%%"),
-                    "perc_times_beated": st.column_config.NumberColumn("Win Rate", help="The consistency score.", format="%.1f%%"),
-                    "beated_by_percent_avg": st.column_config.NumberColumn("Avg Win %", format="%.2f%%"),
-                    "lost_by_percent_avg": st.column_config.NumberColumn("Avg Loss %", format="%.2f%%"),
-                    "MaxDrawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%"),
-                    "perc_times_dd_less": st.column_config.NumberColumn("% DD Less", format="%.1f%%"),
-                    "dd_less_by_percent_avg": st.column_config.NumberColumn("Avg DD Saved %", format="%.2f%%"),
-                    "Daily_Return_Corr": st.column_config.NumberColumn("Daily Corr", format="%.2f"),
-                    "Monthly_Return_Corr": st.column_config.NumberColumn("Monthly Corr", format="%.2f"),
-                    "Quaterly_Return_Corr": st.column_config.NumberColumn("Quarterly Corr", format="%.2f")
-                }
-                
-                subset_cols = [
-                    'return_rank', 'fund_name', 'percent_rolling_avg', 'Wtd_avg_outperformance',
-                    'perc_times_beated', 'beated_by_percent_avg', 'lost_by_percent_avg',
-                    'MaxDrawdown', 'perc_times_dd_less', 'dd_less_by_percent_avg',
-                    'Daily_Return_Corr', 'Monthly_Return_Corr', 'Quaterly_Return_Corr'
-                ]
-                
-                valid_subset = [c for c in subset_cols if c in df.columns]
-                
-                st.dataframe(
-                    df[valid_subset],
-                    column_config=column_configuration,
-                    use_container_width=True, 
-                    height=600
-                )
+                st.dataframe(df, use_container_width=True, height=600)
             else:
                 df = calculate_quarterly_ranks(nav, maps)
                 st.dataframe(df.style.format({'% Time in Top 5': '{:.1f}%'}, na_rep=""), use_container_width=True, height=600)
@@ -539,6 +425,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126:
+                        # Pass raw price series slice of benchmark
                         b_slice_price = get_lookback_data(benchmark_series.to_frame(), date)['nav']
                         val = calculate_residual_momentum(s, b_slice_price)
                         if not pd.isna(val): scores[col] = val
@@ -835,7 +722,8 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
                  b_slice_price = get_lookback_data(benchmark_series.to_frame(), analysis_date)['nav']
                  val = calculate_residual_momentum(s, b_slice_price)
 
-        row['Score'] = val if not np.isnan(val) else -999
+        # Rank Fix: If Val is NaN, put it at bottom (-Inf) so rank works
+        row['Score'] = val if not np.isnan(val) else -float('inf')
         
         fwd_ret = np.nan
         if has_future:
@@ -909,12 +797,13 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold,
                 if sel_d:
                     df_snap = generate_snapshot_table(nav, pd.to_datetime(sel_d), hold, strat_key, maps, cust_w, mom_cfg, nifty, ens_w)
                     if not df_snap.empty:
-                        df_snap = df_snap[['name', 'Strategy Rank', 'Forward Return %', 'Actual Rank']]
+                        df_snap = df_snap[['name', 'Strategy Rank', 'Forward Return %', 'Actual Rank', 'Score']]
                         st.dataframe(
                             df_snap.style.format({
                                 'Forward Return %': "{:.2f}%", 
                                 'Strategy Rank':"{:.0f}", 
-                                'Actual Rank':"{:.0f}"
+                                'Actual Rank':"{:.0f}",
+                                'Score': "{:.4f}"
                             }).background_gradient(subset=['Forward Return %'], cmap='RdYlGn'), 
                             use_container_width=True
                         )
