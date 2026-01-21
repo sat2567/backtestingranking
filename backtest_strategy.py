@@ -22,8 +22,8 @@ st.set_page_config(
 
 # --- Constants ---
 DEFAULT_HOLDING = 126
-DEFAULT_TOP_N = 2
-DEFAULT_TARGET_N = 4
+DEFAULT_TOP_N = 2       # Default set to 2
+DEFAULT_TARGET_N = 4    # Default set to 4
 RISK_FREE_RATE = 0.06
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
@@ -461,7 +461,7 @@ def render_explorer_tab():
                     "return_rank": st.column_config.NumberColumn("Rank", help="The fund's rank based purely on returns (1 is best).", format="%d"),
                     "percent_rolling_avg": st.column_config.NumberColumn("Rolling Avg %", help="The average return of the fund calculated on a rolling basis.", format="%.2f%%"),
                     "Wtd_avg_outperformance": st.column_config.NumberColumn("Wtd Avg Outperf", help="Weighted Average Outperformance.", format="%.2f%%"),
-                    "perc_times_beated": st.column_config.NumberColumn("% Times Beaten", help="The consistency score.", format="%.1f%%"),
+                    "perc_times_beated": st.column_config.NumberColumn("Win Rate", help="The consistency score.", format="%.1f%%"),
                     "beated_by_percent_avg": st.column_config.NumberColumn("Avg Win %", format="%.2f%%"),
                     "lost_by_percent_avg": st.column_config.NumberColumn("Avg Loss %", format="%.2f%%"),
                     "MaxDrawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%"),
@@ -975,7 +975,7 @@ def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
 
 def render_backtest_tab():
     st.header("🚀 Strategy Backtester")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     cat = c1.selectbox("Category", list(FILE_MAPPING.keys()))
     top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N, help="Funds to Buy")
     target_n = c3.number_input("Target N Funds", 1, 20, DEFAULT_TARGET_N, help="Hit Rate Success Target")
