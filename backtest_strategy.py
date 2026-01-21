@@ -117,6 +117,18 @@ def calculate_max_dd(series):
     dd = (comp_ret / peak) - 1
     return dd.min()
 
+def calculate_calmar_ratio(series, analysis_date):
+    if len(series) < 10: return np.nan
+    start_date = series.index[0]
+    end_val = series.iloc[-1]
+    start_val = series.iloc[0]
+    years = (analysis_date - start_date).days / 365.25
+    if years <= 0 or start_val <= 0: return np.nan
+    cagr = (end_val / start_val) ** (1 / years) - 1
+    max_dd = calculate_max_dd(series)
+    if max_dd >= 0: return np.nan 
+    return cagr / abs(max_dd)
+
 def calculate_vol_adj_return(series):
     if series is None or len(series) < 63: return np.nan
     cleaned = series.dropna()
@@ -162,6 +174,22 @@ def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False
         if vol == 0: return np.nan
         return raw_score / vol
     return raw_score
+
+def calculate_beta_alpha_treynor(fund_returns, bench_returns):
+    common_idx = fund_returns.index.intersection(bench_returns.index)
+    if len(common_idx) < 30: return np.nan, np.nan, np.nan
+    f_ret = fund_returns.loc[common_idx]
+    b_ret = bench_returns.loc[common_idx]
+    excess_fund = f_ret - DAILY_RISK_FREE_RATE
+    excess_bench = b_ret - DAILY_RISK_FREE_RATE
+    cov_matrix = np.cov(excess_fund, excess_bench)
+    beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+    if np.isnan(beta): return np.nan, np.nan, np.nan
+    annual_excess_fund = excess_fund.mean() * TRADING_DAYS_YEAR
+    annual_excess_bench = excess_bench.mean() * TRADING_DAYS_YEAR
+    alpha = annual_excess_fund - beta * annual_excess_bench
+    treynor = annual_excess_fund / beta if beta != 0 else np.nan
+    return beta, alpha, treynor
 
 def calculate_information_ratio(fund_returns, bench_returns):
     common_idx = fund_returns.index.intersection(bench_returns.index)
@@ -264,10 +292,202 @@ def load_nifty_data():
     except: return None
 
 # ============================================================================
-# 4. EXPLORER LOGIC (Keep as is)
+# 4. EXPLORER LOGIC
 # ============================================================================
-# (Skipping calculate_analytics_metrics code block for brevity as it was correct in previous version)
-# (Skipping calculate_quarterly_ranks code block for brevity)
+
+def calculate_analytics_metrics(nav_df, scheme_map, benchmark_series=None):
+    if nav_df is None or nav_df.empty or benchmark_series is None: return pd.DataFrame()
+    
+    bench_rolling_1y = benchmark_series.pct_change(252).dropna()
+    bench_daily = benchmark_series.pct_change().dropna()
+    bench_monthly = benchmark_series.resample('M').last().pct_change().dropna()
+    bench_quarterly = benchmark_series.resample('Q').last().pct_change().dropna()
+    
+    b_comp = (1 + bench_daily).cumprod()
+    b_peak = b_comp.expanding(min_periods=1).max()
+    bench_dd = (b_comp / b_peak) - 1
+    
+    metrics = []
+    
+    for col in nav_df.columns:
+        series = nav_df[col].dropna()
+        if len(series) < 260: continue
+        
+        fund_roll = series.pct_change(252).dropna()
+        common_roll = fund_roll.index.intersection(bench_rolling_1y.index)
+        
+        if len(common_roll) < 10: continue
+        
+        f_r = fund_roll.loc[common_roll]
+        b_r = bench_rolling_1y.loc[common_roll]
+        
+        percent_rolling_avg = f_r.mean() * 100
+        
+        diff = f_r - b_r
+        beats = diff[diff > 0]
+        losses = diff[diff <= 0]
+        
+        perc_times_beated = (len(beats) / len(diff)) * 100
+        beated_by_percent_avg = beats.mean() * 100 if not beats.empty else 0
+        lost_by_percent_avg = losses.mean() * 100 if not losses.empty else 0
+        
+        beated_by_percent_max = beats.max() * 100 if not beats.empty else 0
+        beated_by_percent_min = beats.min() * 100 if not beats.empty else 0
+        lost_by_percent_max = losses.min() * 100 if not losses.empty else 0
+        lost_by_percent_min = losses.max() * 100 if not losses.empty else 0
+        
+        win_rate = perc_times_beated / 100
+        loss_rate = 1 - win_rate
+        wtd_avg_out = (win_rate * beated_by_percent_avg) + (loss_rate * lost_by_percent_avg)
+        
+        daily_ret = series.pct_change().dropna()
+        comp = (1 + daily_ret).cumprod()
+        peak = comp.expanding(min_periods=1).max()
+        fund_dd = (comp / peak) - 1
+        max_drawdown = fund_dd.min() * 100
+        
+        common_dd_idx = fund_dd.index.intersection(bench_dd.index)
+        if len(common_dd_idx) > 10:
+            f_dd = fund_dd.loc[common_dd_idx]
+            b_dd = bench_dd.loc[common_dd_idx]
+            dd_diff = f_dd - b_dd 
+            less_dd = dd_diff[dd_diff > 0]
+            more_dd = dd_diff[dd_diff < 0]
+            
+            perc_times_dd_less = (len(less_dd) / len(dd_diff)) * 100
+            dd_less_by_percent_avg = less_dd.mean() * 100 if not less_dd.empty else 0
+            dd_greater_by_percent_avg = more_dd.mean() * 100 if not more_dd.empty else 0
+            dd_greater_max = more_dd.min() * 100 if not more_dd.empty else 0
+            dd_less_min = less_dd.min() * 100 if not less_dd.empty else 0
+        else:
+            perc_times_dd_less, dd_less_by_percent_avg, dd_greater_by_percent_avg = 0,0,0
+            dd_greater_max, dd_less_min = 0,0
+            
+        common_daily = daily_ret.index.intersection(bench_daily.index)
+        daily_corr = daily_ret.loc[common_daily].corr(bench_daily.loc[common_daily]) if len(common_daily)>10 else np.nan
+        
+        fund_monthly = series.resample('M').last().pct_change().dropna()
+        common_monthly = fund_monthly.index.intersection(bench_monthly.index)
+        monthly_corr = fund_monthly.loc[common_monthly].corr(bench_monthly.loc[common_monthly]) if len(common_monthly)>5 else np.nan
+        
+        fund_quarterly = series.resample('Q').last().pct_change().dropna()
+        common_quarterly = fund_quarterly.index.intersection(bench_quarterly.index)
+        quart_corr = fund_quarterly.loc[common_quarterly].corr(bench_quarterly.loc[common_quarterly]) if len(common_quarterly)>3 else np.nan
+
+        metrics.append({
+            'fund_name': scheme_map.get(col, col),
+            'percent_rolling_avg': percent_rolling_avg,
+            'beated_by_percent_avg': beated_by_percent_avg,
+            'lost_by_percent_avg': lost_by_percent_avg,
+            'perc_times_beated': perc_times_beated,
+            'beated_by_percent_max': beated_by_percent_max,
+            'beated_by_percent_min': beated_by_percent_min,
+            'lost_by_percent_max': lost_by_percent_max,
+            'lost_by_percent_min': lost_by_percent_min,
+            'Wtd_avg_outperformance': wtd_avg_out,
+            'MaxDrawdown': max_drawdown,
+            'dd_less_by_percent_avg': dd_less_by_percent_avg,
+            'dd_greater_by_percent_avg': dd_greater_by_percent_avg,
+            'perc_times_dd_less': perc_times_dd_less,
+            'dd_greater_max': dd_greater_max,
+            'dd_less_min': dd_less_min,
+            'Daily_Return_Corr': daily_corr,
+            'Monthly_Return_Corr': monthly_corr,
+            'Quaterly_Return_Corr': quart_corr
+        })
+        
+    df = pd.DataFrame(metrics)
+    if not df.empty:
+        df['return_rank'] = df['percent_rolling_avg'].rank(ascending=False, method='min')
+        cols = [
+            'return_rank', 'fund_name', 'percent_rolling_avg', 'Wtd_avg_outperformance',
+            'perc_times_beated', 'beated_by_percent_avg', 'lost_by_percent_avg',
+            'MaxDrawdown', 'perc_times_dd_less', 'dd_less_by_percent_avg',
+            'Daily_Return_Corr', 'Monthly_Return_Corr', 'Quaterly_Return_Corr'
+        ]
+        remaining = [c for c in df.columns if c not in cols]
+        df = df[cols + remaining].sort_values('return_rank')
+        
+    return df
+
+def calculate_quarterly_ranks(nav_df, scheme_map):
+    if nav_df is None or nav_df.empty: return pd.DataFrame()
+    quarter_ends = pd.date_range(start=nav_df.index.min(), end=nav_df.index.max(), freq='Q')
+    history_data = {}
+    for q_date in quarter_ends:
+        start_lookback = q_date - pd.Timedelta(days=365)
+        if start_lookback < nav_df.index.min(): continue
+        try:
+            idx_now = nav_df.index.asof(q_date)
+            idx_prev = nav_df.index.asof(start_lookback)
+            if pd.isna(idx_now) or pd.isna(idx_prev): continue
+            rets = (nav_df.loc[idx_now] / nav_df.loc[idx_prev]) - 1
+            ranks = rets.rank(ascending=False, method='min')
+            history_data[q_date.strftime('%Y-%m-%d')] = ranks
+        except: continue
+    rank_df = pd.DataFrame(history_data)
+    rank_df.index = rank_df.index.map(lambda x: scheme_map.get(x, x))
+    rank_df = rank_df.dropna(how='all')
+    
+    if not rank_df.empty:
+        def calc_top5_perc(row):
+            valid = row.dropna()
+            if len(valid) == 0: return 0.0
+            return (valid <= 5).sum() / len(valid) * 100
+        
+        rank_df['% Time in Top 5'] = rank_df.apply(calc_top5_perc, axis=1)
+        rank_df = rank_df.sort_values('% Time in Top 5', ascending=False)
+        
+    return rank_df
+
+def render_explorer_tab():
+    st.header("📂 Category Explorer")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        cat = st.selectbox("Select Category", list(FILE_MAPPING.keys()))
+        view = st.radio("View Mode", ["Performance Metrics", "Quarterly Ranking History"])
+    with col2:
+        with st.spinner(f"Processing {cat}..."):
+            nav, maps = load_fund_data_raw(cat)
+            if nav is None: st.error("Data not found."); return
+            if view == "Performance Metrics":
+                nifty = load_nifty_data()
+                df = calculate_analytics_metrics(nav, maps, nifty)
+                
+                column_configuration = {
+                    "fund_name": st.column_config.TextColumn("Fund Name", help="Name of the mutual fund scheme."),
+                    "return_rank": st.column_config.NumberColumn("Rank", help="The fund's rank based purely on returns (1 is best).", format="%d"),
+                    "percent_rolling_avg": st.column_config.NumberColumn("Rolling Avg %", help="The average return of the fund calculated on a rolling basis.", format="%.2f%%"),
+                    "Wtd_avg_outperformance": st.column_config.NumberColumn("Wtd Avg Outperf", help="Weighted Average Outperformance.", format="%.2f%%"),
+                    "perc_times_beated": st.column_config.NumberColumn("% Times Beaten", help="The consistency score.", format="%.1f%%"),
+                    "beated_by_percent_avg": st.column_config.NumberColumn("Avg Win %", format="%.2f%%"),
+                    "lost_by_percent_avg": st.column_config.NumberColumn("Avg Loss %", format="%.2f%%"),
+                    "MaxDrawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%"),
+                    "perc_times_dd_less": st.column_config.NumberColumn("% DD Less", format="%.1f%%"),
+                    "dd_less_by_percent_avg": st.column_config.NumberColumn("Avg DD Saved %", format="%.2f%%"),
+                    "Daily_Return_Corr": st.column_config.NumberColumn("Daily Corr", format="%.2f"),
+                    "Monthly_Return_Corr": st.column_config.NumberColumn("Monthly Corr", format="%.2f"),
+                    "Quaterly_Return_Corr": st.column_config.NumberColumn("Quarterly Corr", format="%.2f")
+                }
+                
+                subset_cols = [
+                    'return_rank', 'fund_name', 'percent_rolling_avg', 'Wtd_avg_outperformance',
+                    'perc_times_beated', 'beated_by_percent_avg', 'lost_by_percent_avg',
+                    'MaxDrawdown', 'perc_times_dd_less', 'dd_less_by_percent_avg',
+                    'Daily_Return_Corr', 'Monthly_Return_Corr', 'Quaterly_Return_Corr'
+                ]
+                
+                valid_subset = [c for c in subset_cols if c in df.columns]
+                
+                st.dataframe(
+                    df[valid_subset],
+                    column_config=column_configuration,
+                    use_container_width=True, 
+                    height=600
+                )
+            else:
+                df = calculate_quarterly_ranks(nav, maps)
+                st.dataframe(df.style.format({'% Time in Top 5': '{:.1f}%'}, na_rep=""), use_container_width=True, height=600)
 
 # ============================================================================
 # 5. BACKTESTER LOGIC (UPDATED WITH NEW STRATEGIES)
@@ -495,6 +715,15 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
                 if custom_weights.get('sortino',0): row['sortino'] = calculate_sortino_ratio(rets)
                 if custom_weights.get('volatility',0): row['volatility'] = calculate_volatility(rets)
                 if custom_weights.get('maxdd',0): row['maxdd'] = calculate_max_dd(s)
+                if custom_weights.get('calmar',0): row['calmar'] = calculate_calmar_ratio(s, date)
+                if custom_weights.get('info_ratio',0): row['info_ratio'] = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+                if custom_weights.get('beta',0) or custom_weights.get('alpha',0) or custom_weights.get('treynor',0):
+                    if bench_rets is not None:
+                        b, a, t = calculate_beta_alpha_treynor(rets, bench_rets)
+                        row['beta'] = b
+                        row['alpha'] = a
+                        row['treynor'] = t
+
                 temp_data.append(row)
              
              if temp_data:
@@ -502,7 +731,7 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
                  f_sc = pd.Series(0.0, index=df_met.index)
                  for k, w in custom_weights.items():
                      if k in df_met.columns:
-                         if k in ['volatility', 'maxdd']: rank = df_met[k].abs().rank(pct=True, ascending=False)
+                         if k in ['volatility', 'maxdd', 'beta']: rank = df_met[k].abs().rank(pct=True, ascending=False)
                          else: rank = df_met[k].rank(pct=True, ascending=True)
                          f_sc = f_sc.add(rank*w, fill_value=0)
                  scores = f_sc.to_dict()
@@ -546,10 +775,92 @@ def run_backtest(nav_wide, strategy_type, top_n, holding_days, custom_weights, m
             'hit_rate': hit_rate,
             'regime': regime_status
         })
-        eq_curve.append({'date': nav_wide.index[exit_i], 'value': cap})
-        bench_curve.append({'date': nav_wide.index[exit_i], 'value': b_cap})
+        eq_curve.append({'date': nav.index[exit_i], 'value': cap})
+        bench_curve.append({'date': nav.index[exit_i], 'value': b_cap})
 
     return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve)
+
+def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type, names_map, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
+    try: idx = nav_wide.index.get_loc(analysis_date)
+    except: return pd.DataFrame()
+    
+    entry_idx = idx + 1
+    exit_idx = entry_idx + holding_days
+    has_future = (exit_idx < len(nav_wide))
+    hist_data = get_lookback_data(nav_wide, analysis_date)
+    temp = []
+    
+    bench_rets = None
+    if benchmark_series is not None:
+        try:
+            b_slice = get_lookback_data(benchmark_series.to_frame(), analysis_date)
+            bench_rets = b_slice['nav'].pct_change().dropna()
+        except: pass
+
+    for col in nav_wide.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 126: continue
+        row = {'id': col, 'name': names_map.get(col, col)}
+        val = np.nan
+        rets = s.pct_change().dropna()
+        
+        if strategy_type == 'consistent_alpha':
+            wr = calculate_rolling_win_rate(s, benchmark_series.loc[:analysis_date]) if benchmark_series is not None else 0.5
+            ir = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+            val = (wr * 0.6) + (ir * 0.4) 
+        
+        elif strategy_type == 'omega':
+            val = calculate_omega_ratio(rets)
+            
+        elif strategy_type == 'capture_ratio':
+            val = calculate_capture_score(rets, bench_rets) if bench_rets is not None else 0
+            
+        elif strategy_type == 'martin':
+            val = calculate_martin_ratio(s)
+            
+        elif strategy_type == 'info_ratio':
+            val = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+
+        elif strategy_type == 'momentum':
+            val = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
+        elif strategy_type == 'var': val = calculate_vol_adj_return(s)
+        elif strategy_type == 'sharpe': val = calculate_sharpe_ratio(rets)
+        elif strategy_type == 'sortino': val = calculate_sortino_ratio(rets)
+        elif strategy_type == 'custom':
+            score = 0
+            if custom_weights.get('sharpe',0): score += calculate_sharpe_ratio(rets) * custom_weights['sharpe']
+            val = score
+        elif strategy_type == 'ensemble':
+            val = 0 
+        
+        # New Snapshot Strategies
+        elif strategy_type == 'stable_momentum':
+             if len(s) > 200:
+                ret_12m = (s.iloc[-1] / s.iloc[0]) - 1
+                vol_12m = s.pct_change().std() * np.sqrt(252)
+                val = ret_12m / vol_12m if vol_12m > 0 else 0
+        
+        elif strategy_type == 'residual_momentum':
+             if benchmark_series is not None:
+                 b_slice_price = get_lookback_data(benchmark_series.to_frame(), analysis_date)['nav']
+                 val = calculate_residual_momentum(s, b_slice_price)
+
+        row['Score'] = val if not np.isnan(val) else -999
+        
+        fwd_ret = np.nan
+        if has_future:
+            try: fwd_ret = (nav_wide[col].iloc[exit_idx] / nav_wide[col].iloc[entry_idx]) - 1
+            except: pass
+        row['Forward Return %'] = fwd_ret * 100
+        temp.append(row)
+        
+    df = pd.DataFrame(temp)
+    if df.empty: return df
+    
+    df['Strategy Rank'] = df['Score'].rank(ascending=False, method='min')
+    if has_future: df['Actual Rank'] = df['Forward Return %'].rank(ascending=False, method='min')
+    else: df['Actual Rank'] = np.nan
+    return df.sort_values('Strategy Rank')
 
 # ============================================================================
 # 6. UI COMPONENTS
@@ -585,8 +896,42 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, hold, cust_w, m
         
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{strat_key}")
         
-        with st.expander("🔎 View Trade Logs"):
-            st.dataframe(hist)
+        st.divider()
+        st.subheader("🔍 Deep Dive Snapshot")
+        
+        max_idx_possible = len(nav) - hold - 1
+        if max_idx_possible > 0:
+            max_valid_date = nav.index[max_idx_possible]
+            start_snapshot_date = nav.index.min() + pd.Timedelta(days=370)
+            
+            if start_snapshot_date < max_valid_date:
+                quarterly_dates = pd.date_range(start=start_snapshot_date, end=max_valid_date, freq='Q')
+                valid_dates = []
+                for d in quarterly_dates:
+                    trading_day = nav.index.asof(d)
+                    if pd.notna(trading_day):
+                        valid_dates.append(trading_day)
+                valid_dates = sorted(list(set(valid_dates)), reverse=True)
+                d_str = [d.strftime('%Y-%m-%d') for d in valid_dates]
+                
+                sel_d = st.selectbox("Snapshot Date (Quarterly)", d_str, key=f"dd_{strat_key}")
+                
+                if sel_d:
+                    df_snap = generate_snapshot_table(nav, pd.to_datetime(sel_d), hold, strat_key, maps, cust_w, mom_cfg, nifty, ens_w)
+                    if not df_snap.empty:
+                        df_snap = df_snap[['name', 'Strategy Rank', 'Forward Return %', 'Actual Rank']]
+                        st.dataframe(
+                            df_snap.style.format({
+                                'Forward Return %': "{:.2f}%", 
+                                'Strategy Rank':"{:.0f}", 
+                                'Actual Rank':"{:.0f}"
+                            }).background_gradient(subset=['Forward Return %'], cmap='RdYlGn'), 
+                            use_container_width=True
+                        )
+            else:
+                st.warning("Not enough data history to generate quarterly snapshots.")
+        else:
+            st.warning("Holding period is too long relative to the available data history.")
     else:
         st.warning("No trades generated or insufficient data.")
 
@@ -694,7 +1039,34 @@ def render_backtest_tab():
 
     with tabs[9]:
         st.write("Custom weights...")
-        display_backtest_results(nav, maps, nifty, 'custom', top_n, hold, {'sharpe':1.0}, {})
+        col_c1, col_c2, col_c3 = st.columns(3)
+        cw_sh = col_c1.slider("Sharpe Ratio", 0.0, 1.0, 0.5, key="c_sh")
+        cw_so = col_c2.slider("Sortino Ratio", 0.0, 1.0, 0.0, key="c_so")
+        cw_mo = col_c3.slider("Momentum", 0.0, 1.0, 0.5, key="c_mo")
+        col_c4, col_c5, col_c6 = st.columns(3)
+        cw_vo = col_c4.slider("Low Volatility", 0.0, 1.0, 0.0, key="c_vo")
+        cw_ir = col_c5.slider("Information Ratio", 0.0, 1.0, 0.0, key="c_ir")
+        cw_maxdd = col_c6.slider("Low Max Drawdown", 0.0, 1.0, 0.0, key="c_maxdd")
+        col_c7, col_c8, col_c9 = st.columns(3)
+        cw_ca = col_c7.slider("Calmar Ratio", 0.0, 1.0, 0.0, key="c_ca")
+        cw_alpha = col_c8.slider("Jensen's Alpha", 0.0, 1.0, 0.0, key="c_al")
+        cw_treynor = col_c9.slider("Treynor Ratio", 0.0, 1.0, 0.0, key="c_tr")
+        col_c10 = st.columns(1)[0]
+        cw_beta = col_c10.slider("Low Beta", 0.0, 1.0, 0.0, key="c_be")
+        
+        raw_weights = {
+            'sharpe': cw_sh, 'sortino': cw_so, 'momentum': cw_mo, 
+            'volatility': cw_vo, 'info_ratio': cw_ir, 'maxdd': cw_maxdd,
+            'calmar': cw_ca, 'alpha': cw_alpha, 'treynor': cw_treynor, 'beta': cw_beta
+        }
+        total_weight = sum(raw_weights.values())
+        
+        if total_weight > 0:
+            final_weights = {k: v / total_weight for k, v in raw_weights.items()}
+            m_c = {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}
+            display_backtest_results(nav, maps, nifty, 'custom', top_n, hold, final_weights, m_c)
+        else:
+            st.warning("Please select at least one weight > 0")
 
 def main():
     t1, t2 = st.tabs(["📂 Category Explorer", "🚀 Strategy Backtester"])
