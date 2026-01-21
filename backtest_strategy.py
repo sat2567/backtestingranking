@@ -22,7 +22,8 @@ st.set_page_config(
 
 # --- Constants ---
 DEFAULT_HOLDING = 126
-DEFAULT_TOP_N = 5
+DEFAULT_TOP_N = 2       # UPDATED: Default set to 2
+DEFAULT_TARGET_N = 4    # UPDATED: Default set to 4
 RISK_FREE_RATE = 0.06
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
@@ -491,7 +492,7 @@ def render_explorer_tab():
                 st.dataframe(df.style.format({'% Time in Top 5': '{:.1f}%'}, na_rep=""), use_container_width=True, height=600)
 
 # ============================================================================
-# 5. BACKTESTER LOGIC (UPDATED WITH NEW STRATEGIES)
+# 5. BACKTESTER LOGIC (UPDATED WITH TARGET N HIT RATE)
 # ============================================================================
 
 def get_lookback_data(nav, analysis_date):
@@ -499,7 +500,7 @@ def get_lookback_data(nav, analysis_date):
     start_date = analysis_date - pd.Timedelta(days=max_days)
     return nav[(nav.index >= start_date) & (nav.index < analysis_date)]
 
-def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
+def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
     
     # --- 1. DYNAMIC TIMELINE HANDLING ---
     start_date = nav.index.min() + pd.Timedelta(days=370)
@@ -507,7 +508,6 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         
     start_idx = nav.index.searchsorted(start_date)
-    # Loop until end of data - 1 day to allow at least 1 day trade
     rebal_idx = list(range(start_idx, len(nav) - 1, holding_days))
     
     if not rebal_idx: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -538,27 +538,22 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                 for col in nav.columns:
                     s = hist[col].dropna()
                     if len(s) > 126:
-                        # Pass raw price series slice of benchmark
                         b_slice_price = get_lookback_data(benchmark_series.to_frame(), date)['nav']
                         val = calculate_residual_momentum(s, b_slice_price)
                         if not pd.isna(val): scores[col] = val
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # B. STABLE MOMENTUM (High Mom -> Low DD)
+        # B. STABLE MOMENTUM
         elif strategy_type == 'stable_momentum':
-            # Pass 1: Broad Pool by Momentum (6M + 12M)
             mom_scores = {}
             for col in nav.columns:
                 s = hist[col].dropna()
                 if len(s) >= 260:
-                    # Simple Momentum (3M + 6M + 12M)
                     val = calculate_flexible_momentum(s, 0.33, 0.33, 0.33, False)
                     if not pd.isna(val): mom_scores[col] = val
             
-            # Select Pool (2x Top N)
             pool = sorted(mom_scores, key=mom_scores.get, reverse=True)[:top_n*2]
             
-            # Pass 2: Filter by Drawdown (Highest value = Closest to 0)
             dd_scores = {}
             for col in pool:
                 dd = calculate_max_dd(hist[col].dropna())
@@ -577,16 +572,14 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                     val = np.nan
                     
                     if regime == 'bull':
-                        # Bull: Momentum
                         val = calculate_flexible_momentum(s, 0.3, 0.3, 0.4, False)
                     else:
-                        # Bear: Sharpe (Quality)
                         val = calculate_sharpe_ratio(s.pct_change().dropna())
                     
                     if not pd.isna(val): scores[col] = val
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # D. ENSEMBLE (Existing)
+        # D. ENSEMBLE
         elif strategy_type == 'ensemble':
             fund_ranks = pd.DataFrame(index=nav.columns)
             
@@ -596,7 +589,6 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                 s = s.reindex(fund_ranks.index)
                 return s.rank(pct=True, ascending=True).fillna(0)
 
-            # --- Calculate Components based on Weights ---
             if ensemble_weights.get('momentum', 0) > 0:
                 temp = {}
                 for col in nav.columns:
@@ -657,7 +649,6 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                          temp[col] = (wr * 0.6) + (ir * 0.4) if not pd.isna(ir) else 0
                 fund_ranks['consistent_alpha'] = dict_to_norm_rank(temp)
 
-            # Combine Weights
             final_score = pd.Series(0.0, index=fund_ranks.index)
             if sum(ensemble_weights.values()) > 0:
                 for k, w in ensemble_weights.items():
@@ -682,7 +673,7 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                 scores = final_score.to_dict()
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # F. SINGLE METRICS (Martin, Omega, Sharpe, etc.)
+        # F. SINGLE METRICS
         elif strategy_type in ['martin', 'omega', 'capture_ratio', 'info_ratio', 'momentum', 'sharpe', 'sortino', 'var']:
              for col in nav.columns:
                 s = hist[col].dropna()
@@ -704,7 +695,6 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
 
         # G. CUSTOM WEIGHTS
         elif strategy_type == 'custom':
-             # (Existing custom logic)
              temp_data = []
              for col in nav.columns:
                 s = hist[col].dropna()
@@ -739,30 +729,29 @@ def run_backtest(nav, strategy_type, top_n, holding_days, custom_weights, moment
                  selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
         # --- EXECUTION ---
-        entry_i = i + 1
+        entry = i + 1
         exit_i = min(i + 1 + holding_days, len(nav)-1)
         
-        # 1. ALWAYS Calculate Benchmark Return for this period
+        # Benchmark Return
         b_ret = 0.0
         if benchmark_series is not None:
-             try: b_ret = (benchmark_series.asof(nav.index[exit_i]) / benchmark_series.asof(nav.index[entry_i])) - 1
+             try: b_ret = (benchmark_series.asof(nav.index[exit_i]) / benchmark_series.asof(nav.index[entry])) - 1
              except: pass
         
-        # 2. Portfolio Return
+        # Portfolio Return
         port_ret = 0.0
         hit_rate = 0.0
         
         if selected:
             # If strategy found funds, calculate their return
-            period_ret_all_funds = (nav.iloc[exit_i] / nav.iloc[entry_i]) - 1
+            period_ret_all_funds = (nav.iloc[exit_i] / nav.iloc[entry]) - 1
             port_ret = period_ret_all_funds[selected].mean()
             
-            actual_top_n_funds = period_ret_all_funds.dropna().nlargest(top_n).index.tolist()
-            matches = len(set(selected).intersection(set(actual_top_n_funds)))
+            # --- UPDATED HIT RATE LOGIC (MATCH AGAINST TOP TARGET N) ---
+            actual_top_target_funds = period_ret_all_funds.dropna().nlargest(target_n).index.tolist()
+            matches = len(set(selected).intersection(set(actual_top_target_funds)))
             hit_rate = matches / top_n if top_n > 0 else 0
         else:
-            # If strategy sat out (e.g. strict filters), return is 0 (Cash)
-            # But we DO NOT skip the loop. Benchmark keeps running.
             port_ret = 0.0
             hit_rate = 0.0
         
@@ -834,7 +823,6 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
         elif strategy_type == 'ensemble':
             val = 0 
         
-        # New Snapshot Strategies
         elif strategy_type == 'stable_momentum':
              if len(s) > 200:
                 ret_12m = (s.iloc[-1] / s.iloc[0]) - 1
@@ -867,8 +855,8 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
 # 6. UI COMPONENTS
 # ============================================================================
 
-def display_backtest_results(nav, maps, nifty, strat_key, top_n, hold, cust_w, mom_cfg, ens_w=None):
-    hist, eq, ben = run_backtest(nav, strat_key, top_n, hold, cust_w, mom_cfg, nifty, ens_w)
+def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold, cust_w, mom_cfg, ens_w=None):
+    hist, eq, ben = run_backtest(nav, strat_key, top_n, target_n, hold, cust_w, mom_cfg, nifty, ens_w)
     
     if not eq.empty:
         start_date = eq.iloc[0]['date']
@@ -936,10 +924,9 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, hold, cust_w, m
     else:
         st.warning("No trades generated or insufficient data.")
 
-def render_comparison_tab(nav, maps, nifty, top_n, hold):
+def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
     st.markdown("### 🏆 Strategy Leaderboard")
     
-    # ADDED NEW STRATEGIES HERE
     strategies = {
         'Stable Momentum': ('stable_momentum', {}, {}, None),
         'Regime Switch (Smart)': ('regime_switch', {}, {}, None),
@@ -956,7 +943,7 @@ def render_comparison_tab(nav, maps, nifty, top_n, hold):
     
     progress = st.progress(0)
     for idx, (name, (key, cust, mom, ens)) in enumerate(strategies.items()):
-        hist, eq, ben = run_backtest(nav, key, top_n, hold, cust, mom, nifty, ens)
+        hist, eq, ben = run_backtest(nav, key, top_n, target_n, hold, cust, mom, nifty, ens)
         if not eq.empty:
             start_date = eq.iloc[0]['date']
             end_date = eq.iloc[-1]['date']
@@ -980,15 +967,17 @@ def render_comparison_tab(nav, maps, nifty, top_n, hold):
 
     if results:
         df_res = pd.DataFrame(results).set_index('Strategy').sort_values('CAGR %', ascending=False)
+        st.caption(f"Hit Rate Logic: How many of the Top {top_n} selected funds landed in the Top {target_n} actual performers.")
         st.dataframe(df_res.style.format("{:.2f}").background_gradient(subset=['CAGR %'], cmap='Greens'), use_container_width=True)
         st.plotly_chart(fig, use_container_width=True, key="comparison_chart")
 
 def render_backtest_tab():
     st.header("🚀 Strategy Backtester")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     cat = c1.selectbox("Category", list(FILE_MAPPING.keys()))
-    top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N)
-    hold = c3.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING) # Max 504 days
+    top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N, help="Funds to Buy")
+    target_n = c3.number_input("Target N Funds", 1, 20, DEFAULT_TARGET_N, help="Hit Rate Success Target")
+    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING)
     
     with st.spinner("Loading Data..."):
         nav, maps = load_fund_data_raw(cat)
@@ -1003,40 +992,40 @@ def render_backtest_tab():
     ])
     
     with tabs[0]:
-        if st.button("Run Comparison Analysis"):
-            render_comparison_tab(nav, maps, nifty, top_n, hold)
+        # RUNS AUTOMATICALLY NOW (Button Removed)
+        render_comparison_tab(nav, maps, nifty, top_n, target_n, hold)
 
     with tabs[1]:
         st.info("🚦 **Regime Switch Strategy**")
         st.markdown("**Logic:** Bull Market (>200 DMA) = **Momentum**. Bear Market (<200 DMA) = **Sharpe/Quality**.")
-        display_backtest_results(nav, maps, nifty, 'regime_switch', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'regime_switch', top_n, target_n, hold, {}, {})
 
     with tabs[2]:
         st.info("⚓ **Stable Momentum**")
         st.markdown("**Logic:** 1. Get Top 2x funds by **Momentum**. 2. Filter that pool for **Lowest Drawdown**.")
-        display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, target_n, hold, {}, {})
 
     with tabs[3]:
         st.info("📉 **Residual Momentum**")
         st.markdown("**Logic:** Ranking by the **Alpha Residuals** of a regression (Fund vs Benchmark). Removes market beta noise.")
-        display_backtest_results(nav, maps, nifty, 'residual_momentum', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'residual_momentum', top_n, target_n, hold, {}, {})
 
     with tabs[4]:
         st.info("🧩 **Ensemble Strategy**")
-        display_backtest_results(nav, maps, nifty, 'ensemble', top_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, {'momentum':0.4, 'capture':0.6})
+        display_backtest_results(nav, maps, nifty, 'ensemble', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, {'momentum':0.4, 'capture':0.6})
 
     with tabs[5]:
         st.info("🧠 **Consistent Alpha**")
-        display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, target_n, hold, {}, {})
 
     with tabs[6]:
-        display_backtest_results(nav, maps, nifty, 'martin', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'martin', top_n, target_n, hold, {}, {})
         
     with tabs[7]:
-        display_backtest_results(nav, maps, nifty, 'momentum', top_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True})
+        display_backtest_results(nav, maps, nifty, 'momentum', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True})
 
     with tabs[8]:
-        display_backtest_results(nav, maps, nifty, 'sharpe', top_n, hold, {}, {})
+        display_backtest_results(nav, maps, nifty, 'sharpe', top_n, target_n, hold, {}, {})
 
     with tabs[9]:
         st.write("Custom weights...")
@@ -1065,7 +1054,7 @@ def render_backtest_tab():
         if total_weight > 0:
             final_weights = {k: v / total_weight for k, v in raw_weights.items()}
             m_c = {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}
-            display_backtest_results(nav, maps, nifty, 'custom', top_n, hold, final_weights, m_c)
+            display_backtest_results(nav, maps, nifty, 'custom', top_n, target_n, hold, final_weights, m_c)
         else:
             st.warning("Please select at least one weight > 0")
 
