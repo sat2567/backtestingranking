@@ -22,8 +22,8 @@ st.set_page_config(
 
 # --- Constants ---
 DEFAULT_HOLDING = 126
-DEFAULT_TOP_N = 2       # UPDATED: Default set to 2
-DEFAULT_TARGET_N = 4    # UPDATED: Default set to 4
+DEFAULT_TOP_N = 2
+DEFAULT_TARGET_N = 4
 RISK_FREE_RATE = 0.06
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
@@ -508,6 +508,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         
     start_idx = nav.index.searchsorted(start_date)
+    # Loop until end of data - 1 day to allow at least 1 day trade
     rebal_idx = list(range(start_idx, len(nav) - 1, holding_days))
     
     if not rebal_idx: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -927,6 +928,7 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold,
 def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
     st.markdown("### 🏆 Strategy Leaderboard")
     
+    # ADDED NEW STRATEGIES HERE
     strategies = {
         'Stable Momentum': ('stable_momentum', {}, {}, None),
         'Regime Switch (Smart)': ('regime_switch', {}, {}, None),
@@ -973,11 +975,11 @@ def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
 
 def render_backtest_tab():
     st.header("🚀 Strategy Backtester")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     cat = c1.selectbox("Category", list(FILE_MAPPING.keys()))
     top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N, help="Funds to Buy")
     target_n = c3.number_input("Target N Funds", 1, 20, DEFAULT_TARGET_N, help="Hit Rate Success Target")
-    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING)
+    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING) # Max 504 days
     
     with st.spinner("Loading Data..."):
         nav, maps = load_fund_data_raw(cat)
