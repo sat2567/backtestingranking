@@ -5,7 +5,6 @@ import os
 import warnings
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from scipy.stats import linregress
 
 warnings.filterwarnings('ignore')
 
@@ -21,7 +20,7 @@ st.set_page_config(
 )
 
 # --- Constants ---
-DEFAULT_HOLDING = 504  # <--- CHANGED TO 504 AS REQUESTED
+DEFAULT_HOLDING = 504  # Default set to 504 days
 DEFAULT_TOP_N = 2
 DEFAULT_TARGET_N = 4
 RISK_FREE_RATE = 0.06
@@ -160,11 +159,8 @@ def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False
         hist_vol_data = series[series.index >= date_1y_ago]
         if len(hist_vol_data) < 20: return np.nan
         
-        # Calculate volatility
+        # Volatility clamp to prevent Infinity
         vol = hist_vol_data.pct_change().dropna().std() * np.sqrt(TRADING_DAYS_YEAR)
-        
-        # --- FIX FOR INFINITY: Volatility Clamp ---
-        # If volatility is extremely low (e.g., < 0.000001), treat it as invalid or clamp it
         if vol < 1e-6: return np.nan
         
         return raw_score / vol
@@ -193,58 +189,41 @@ def calculate_rolling_win_rate(fund_series, bench_series, window=252):
     wins = (f_roll.loc[common_roll] > b_roll.loc[common_roll]).sum()
     return wins / len(common_roll)
 
-# --- NEW QUANT FUNCTIONS (FIXED) ---
+def calculate_beta_alpha_treynor(fund_returns, bench_returns):
+    common_idx = fund_returns.index.intersection(bench_returns.index)
+    if len(common_idx) < 30: return np.nan, np.nan, np.nan
+    
+    y = fund_returns.loc[common_idx]
+    x = bench_returns.loc[common_idx]
+    
+    cov_matrix = np.cov(y, x)
+    beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+    
+    mean_fund = y.mean() * TRADING_DAYS_YEAR
+    mean_bench = x.mean() * TRADING_DAYS_YEAR
+    
+    alpha = mean_fund - (RISK_FREE_RATE + beta * (mean_bench - RISK_FREE_RATE))
+    
+    treynor = (mean_fund - RISK_FREE_RATE) / beta if beta != 0 else np.nan
+    
+    return beta, alpha, treynor
 
-def calculate_residual_momentum(series, benchmark_series):
-    """
-    Calculates Idiosyncratic Momentum.
-    FIXED: Handles constant data and zero residuals to avoid 0 or Inf scores.
-    """
-    # 1. Clean Data
-    s_ret = series.pct_change().dropna()
-    b_ret = benchmark_series.pct_change().dropna()
+def calculate_calmar_ratio(series, current_date):
+    if len(series) < 252: return np.nan
+    three_years_ago = current_date - pd.Timedelta(days=365*3)
+    sub = series[series.index >= three_years_ago]
+    if len(sub) < 100: sub = series 
     
-    # 2. Strict Alignment
-    aligned_data = pd.concat([s_ret, b_ret], axis=1, join='inner').dropna()
+    max_dd = calculate_max_dd(sub)
+    if max_dd == 0 or pd.isna(max_dd): return np.nan
     
-    # 3. Check history
-    if len(aligned_data) < 60: return np.nan
+    start_val = sub.iloc[0]
+    end_val = sub.iloc[-1]
+    years = (sub.index[-1] - sub.index[0]).days / 365.25
+    if years <= 0: return np.nan
+    cagr = (end_val / start_val) ** (1/years) - 1
     
-    y = aligned_data.iloc[:, 0] # Fund
-    x = aligned_data.iloc[:, 1] # Bench
-    
-    # 3.5 Check variance to prevent regression errors
-    if x.std() < 1e-6 or y.std() < 1e-6: return np.nan
-    
-    # 4. Regression
-    slope, intercept, r_value, p_value, std_err = linregress(x, y)
-    
-    if not np.isfinite(slope) or not np.isfinite(intercept): return np.nan
-
-    # 5. Residuals
-    expected_return = (x * slope) + intercept
-    residuals = y - expected_return
-    
-    # 6. Score
-    res_std = residuals.std()
-    
-    # --- FIX FOR ZERO SCORE ---
-    # If res_std is 0 (perfect fit) or extremely close, return NaN
-    if res_std < 1e-6 or pd.isna(res_std): return np.nan 
-    
-    score = residuals.mean() / res_std
-    
-    if not np.isfinite(score): return np.nan
-    
-    return score
-
-def get_market_regime(benchmark_series, current_date, window=200):
-    """Determines if Market is Bull (Price > 200 DMA) or Bear."""
-    subset = benchmark_series[benchmark_series.index <= current_date]
-    if len(subset) < window: return 'neutral'
-    current_price = subset.iloc[-1]
-    dma = subset.iloc[-window:].mean()
-    return 'bull' if current_price > dma else 'bear'
+    return cagr / abs(max_dd)
 
 # ============================================================================
 # 3. DATA LOADING
@@ -396,7 +375,7 @@ def render_explorer_tab():
                 st.dataframe(df.style.format({'% Time in Top 5': '{:.1f}%'}, na_rep=""), use_container_width=True, height=600)
 
 # ============================================================================
-# 5. BACKTESTER LOGIC (UPDATED WITH TARGET N HIT RATE)
+# 5. BACKTESTER LOGIC
 # ============================================================================
 
 def get_lookback_data(nav, analysis_date):
@@ -412,7 +391,6 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         
     start_idx = nav.index.searchsorted(start_date)
-    # Loop until end of data - 1 day to allow at least 1 day trade
     rebal_idx = list(range(start_idx, len(nav) - 1, holding_days))
     
     if not rebal_idx: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -433,26 +411,11 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
 
         scores = {}
         selected = []
-        regime_status = "neutral"
 
         # --- STRATEGY SELECTION LOGIC ---
 
-        # A. RESIDUAL MOMENTUM
-        if strategy_type == 'residual_momentum':
-            if benchmark_series is not None:
-                for col in nav.columns:
-                    s = hist[col].dropna()
-                    if len(s) > 126:
-                        # Pass raw price series slice of benchmark
-                        b_slice_price = get_lookback_data(benchmark_series.to_frame(), date)['nav']
-                        val = calculate_residual_momentum(s, b_slice_price)
-                        # Updated check: exclude NaN, Inf, and Zero
-                        if not pd.isna(val) and np.isfinite(val) and abs(val) > 1e-9:
-                            scores[col] = val
-                selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
-
-        # B. STABLE MOMENTUM
-        elif strategy_type == 'stable_momentum':
+        # A. STABLE MOMENTUM
+        if strategy_type == 'stable_momentum':
             mom_scores = {}
             for col in nav.columns:
                 s = hist[col].dropna()
@@ -468,29 +431,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 if not pd.isna(dd): dd_scores[col] = dd
             selected = sorted(dd_scores, key=dd_scores.get, reverse=True)[:top_n]
 
-        # C. REGIME SWITCH
-        elif strategy_type == 'regime_switch':
-            if benchmark_series is not None:
-                regime = get_market_regime(benchmark_series, date)
-                regime_status = regime
-                
-                for col in nav.columns:
-                    s = hist[col].dropna()
-                    if len(s) < 126: continue
-                    val = np.nan
-                    
-                    if regime == 'bull':
-                        # Use Risk Adjust = True to match logic but we fixed the math inside function
-                        val = calculate_flexible_momentum(s, 0.3, 0.3, 0.4, True)
-                    else:
-                        val = calculate_sharpe_ratio(s.pct_change().dropna())
-                    
-                    # Updated check: exclude NaN, Inf, and Zero
-                    if not pd.isna(val) and np.isfinite(val) and abs(val) > 1e-9:
-                         scores[col] = val
-                selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
-
-        # D. ENSEMBLE
+        # B. ENSEMBLE
         elif strategy_type == 'ensemble':
             fund_ranks = pd.DataFrame(index=nav.columns)
             
@@ -568,7 +509,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
             scores = final_score.to_dict()
             selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # E. CONSISTENT ALPHA
+        # C. CONSISTENT ALPHA
         elif strategy_type == 'consistent_alpha':
             temp_rows = []
             for col in nav.columns:
@@ -584,7 +525,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 scores = final_score.to_dict()
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # F. SINGLE METRICS
+        # D. SINGLE METRICS
         elif strategy_type in ['martin', 'omega', 'capture_ratio', 'info_ratio', 'momentum', 'sharpe', 'sortino', 'var']:
              for col in nav.columns:
                 s = hist[col].dropna()
@@ -604,7 +545,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 if not pd.isna(val): scores[col] = val
              selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # G. CUSTOM WEIGHTS
+        # E. CUSTOM WEIGHTS
         elif strategy_type == 'custom':
              temp_data = []
              for col in nav.columns:
@@ -673,8 +614,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
             'date': date, 
             'selected': selected, 
             'return': port_ret,
-            'hit_rate': hit_rate,
-            'regime': regime_status
+            'hit_rate': hit_rate
         })
         eq_curve.append({'date': nav.index[exit_i], 'value': cap})
         bench_curve.append({'date': nav.index[exit_i], 'value': b_cap})
@@ -739,11 +679,6 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
                 ret_12m = (s.iloc[-1] / s.iloc[0]) - 1
                 vol_12m = s.pct_change().std() * np.sqrt(252)
                 val = ret_12m / vol_12m if vol_12m > 0 else 0
-        
-        elif strategy_type == 'residual_momentum':
-             if benchmark_series is not None:
-                 b_slice_price = get_lookback_data(benchmark_series.to_frame(), analysis_date)['nav']
-                 val = calculate_residual_momentum(s, b_slice_price)
 
         # Rank Fix: If Val is NaN, put it at bottom (-Inf) so rank works
         row['Score'] = val if not np.isnan(val) else -float('inf')
@@ -840,11 +775,9 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold,
 def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
     st.markdown("### 🏆 Strategy Leaderboard")
     
-    # ADDED NEW STRATEGIES HERE
+    # REMOVED Regime Switch and Residual Momentum from Strategy List
     strategies = {
         'Stable Momentum': ('stable_momentum', {}, {}, None),
-        'Regime Switch (Smart)': ('regime_switch', {}, {}, None),
-        'Residual Momentum': ('residual_momentum', {}, {}, None),
         'Consistent Alpha': ('consistent_alpha', {}, {}, None),
         'Martin Ratio': ('martin', {}, {}, None),
         'Ensemble': ('ensemble', {}, {'w_3m':0.33,'w_6m':0.33,'w_12m':0.33,'risk_adjust':True}, {'momentum':0.4, 'capture':0.6}),
@@ -899,49 +832,38 @@ def render_backtest_tab():
     
     if nav is None: st.error("Data not found."); return
 
-    # ADDED TABS FOR NEW STRATEGIES
+    # REMOVED TABS FOR REGIME SWITCH & RESIDUAL MOMENTUM
     tabs = st.tabs([
-        "🏆 Compare All", "🚦 Regime Switch", "⚓ Stable Mom", "📉 Residual Mom", 
+        "🏆 Compare All", "⚓ Stable Mom", 
         "🧩 Ensemble", "🧠 Consistent Alpha", "🛡️ Martin", "🚀 Momentum", "⚖️ Sharpe", "Custom"
     ])
     
     with tabs[0]:
-        # RUNS AUTOMATICALLY NOW (Button Removed)
         render_comparison_tab(nav, maps, nifty, top_n, target_n, hold)
 
     with tabs[1]:
-        st.info("🚦 **Regime Switch Strategy**")
-        st.markdown("**Logic:** Bull Market (>200 DMA) = **Momentum**. Bear Market (<200 DMA) = **Sharpe/Quality**.")
-        display_backtest_results(nav, maps, nifty, 'regime_switch', top_n, target_n, hold, {}, {})
-
-    with tabs[2]:
         st.info("⚓ **Stable Momentum**")
         st.markdown("**Logic:** 1. Get Top 2x funds by **Momentum**. 2. Filter that pool for **Lowest Drawdown**.")
         display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, target_n, hold, {}, {})
 
-    with tabs[3]:
-        st.info("📉 **Residual Momentum**")
-        st.markdown("**Logic:** Ranking by the **Alpha Residuals** of a regression (Fund vs Benchmark). Removes market beta noise.")
-        display_backtest_results(nav, maps, nifty, 'residual_momentum', top_n, target_n, hold, {}, {})
-
-    with tabs[4]:
+    with tabs[2]:
         st.info("🧩 **Ensemble Strategy**")
         display_backtest_results(nav, maps, nifty, 'ensemble', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, {'momentum':0.4, 'capture':0.6})
 
-    with tabs[5]:
+    with tabs[3]:
         st.info("🧠 **Consistent Alpha**")
         display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, target_n, hold, {}, {})
 
-    with tabs[6]:
+    with tabs[4]:
         display_backtest_results(nav, maps, nifty, 'martin', top_n, target_n, hold, {}, {})
         
-    with tabs[7]:
+    with tabs[5]:
         display_backtest_results(nav, maps, nifty, 'momentum', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True})
 
-    with tabs[8]:
+    with tabs[6]:
         display_backtest_results(nav, maps, nifty, 'sharpe', top_n, target_n, hold, {}, {})
 
-    with tabs[9]:
+    with tabs[7]:
         st.write("Custom weights...")
         col_c1, col_c2, col_c3 = st.columns(3)
         cw_sh = col_c1.slider("Sharpe Ratio", 0.0, 1.0, 0.5, key="c_sh")
