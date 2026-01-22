@@ -487,4 +487,495 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                     
                     # Updated check: exclude NaN, Inf, and Zero
                     if not pd.isna(val) and np.isfinite(val) and abs(val) > 1e-9:
-                         scores[col] =
+                         scores[col] = val
+                selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        # D. ENSEMBLE
+        elif strategy_type == 'ensemble':
+            fund_ranks = pd.DataFrame(index=nav.columns)
+            
+            def dict_to_norm_rank(s_dict):
+                if not s_dict: return pd.Series(0, index=fund_ranks.index)
+                s = pd.Series(s_dict)
+                s = s.reindex(fund_ranks.index)
+                return s.rank(pct=True, ascending=True).fillna(0)
+
+            if ensemble_weights.get('momentum', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 70: temp[col] = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
+                fund_ranks['momentum'] = dict_to_norm_rank(temp)
+
+            if ensemble_weights.get('sharpe', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126: temp[col] = calculate_sharpe_ratio(s.pct_change().dropna())
+                fund_ranks['sharpe'] = dict_to_norm_rank(temp)
+                
+            if ensemble_weights.get('martin', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126: temp[col] = calculate_martin_ratio(s)
+                fund_ranks['martin'] = dict_to_norm_rank(temp)
+
+            if ensemble_weights.get('omega', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126: temp[col] = calculate_omega_ratio(s.pct_change().dropna())
+                fund_ranks['omega'] = dict_to_norm_rank(temp)
+                
+            if ensemble_weights.get('capture', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126 and bench_rets is not None: temp[col] = calculate_capture_score(s.pct_change().dropna(), bench_rets)
+                fund_ranks['capture'] = dict_to_norm_rank(temp)
+                
+            if ensemble_weights.get('sortino', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126: temp[col] = calculate_sortino_ratio(s.pct_change().dropna())
+                fund_ranks['sortino'] = dict_to_norm_rank(temp)
+            
+            if ensemble_weights.get('var', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 126: temp[col] = calculate_vol_adj_return(s)
+                fund_ranks['var'] = dict_to_norm_rank(temp)
+
+            if ensemble_weights.get('consistent_alpha', 0) > 0:
+                temp = {}
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) > 252:
+                         wr = calculate_rolling_win_rate(s, benchmark_series.loc[:date]) if benchmark_series is not None else 0.5
+                         rets = s.pct_change().dropna()
+                         ir = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+                         temp[col] = (wr * 0.6) + (ir * 0.4) if not pd.isna(ir) else 0
+                fund_ranks['consistent_alpha'] = dict_to_norm_rank(temp)
+
+            final_score = pd.Series(0.0, index=fund_ranks.index)
+            if sum(ensemble_weights.values()) > 0:
+                for k, w in ensemble_weights.items():
+                    if k in fund_ranks.columns:
+                        final_score += fund_ranks[k] * w
+            scores = final_score.to_dict()
+            selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        # E. CONSISTENT ALPHA
+        elif strategy_type == 'consistent_alpha':
+            temp_rows = []
+            for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 252: continue
+                wr = calculate_rolling_win_rate(s, benchmark_series.loc[:date]) if benchmark_series is not None else 0.5
+                rets = s.pct_change().dropna()
+                ir = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+                temp_rows.append({'id': col, 'win_rate': wr, 'ir': ir if not pd.isna(ir) else 0})
+            if temp_rows:
+                df_sc = pd.DataFrame(temp_rows).set_index('id')
+                final_score = (df_sc['win_rate'].rank(pct=True) * 0.6) + (df_sc['ir'].rank(pct=True) * 0.4)
+                scores = final_score.to_dict()
+                selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        # F. SINGLE METRICS
+        elif strategy_type in ['martin', 'omega', 'capture_ratio', 'info_ratio', 'momentum', 'sharpe', 'sortino', 'var']:
+             for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 126: continue
+                val = np.nan
+                rets = s.pct_change().dropna()
+                
+                if strategy_type == 'martin': val = calculate_martin_ratio(s)
+                elif strategy_type == 'omega': val = calculate_omega_ratio(rets)
+                elif strategy_type == 'capture_ratio': val = calculate_capture_score(rets, bench_rets) if bench_rets is not None else 0
+                elif strategy_type == 'info_ratio': val = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+                elif strategy_type == 'momentum': val = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
+                elif strategy_type == 'sharpe': val = calculate_sharpe_ratio(rets)
+                elif strategy_type == 'sortino': val = calculate_sortino_ratio(rets)
+                elif strategy_type == 'var': val = calculate_vol_adj_return(s)
+                
+                if not pd.isna(val): scores[col] = val
+             selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        # G. CUSTOM WEIGHTS
+        elif strategy_type == 'custom':
+             temp_data = []
+             for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 126: continue
+                rets = s.pct_change().dropna()
+                row = {'id': col}
+                if custom_weights.get('sharpe',0): row['sharpe'] = calculate_sharpe_ratio(rets)
+                if custom_weights.get('momentum',0): row['momentum'] = calculate_flexible_momentum(s, 0.33, 0.33, 0.33, True)
+                if custom_weights.get('sortino',0): row['sortino'] = calculate_sortino_ratio(rets)
+                if custom_weights.get('volatility',0): row['volatility'] = calculate_volatility(rets)
+                if custom_weights.get('maxdd',0): row['maxdd'] = calculate_max_dd(s)
+                if custom_weights.get('calmar',0): row['calmar'] = calculate_calmar_ratio(s, date)
+                if custom_weights.get('info_ratio',0): row['info_ratio'] = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+                if custom_weights.get('beta',0) or custom_weights.get('alpha',0) or custom_weights.get('treynor',0):
+                    if bench_rets is not None:
+                        b, a, t = calculate_beta_alpha_treynor(rets, bench_rets)
+                        row['beta'] = b
+                        row['alpha'] = a
+                        row['treynor'] = t
+
+                temp_data.append(row)
+             
+             if temp_data:
+                 df_met = pd.DataFrame(temp_data).set_index('id')
+                 f_sc = pd.Series(0.0, index=df_met.index)
+                 for k, w in custom_weights.items():
+                     if k in df_met.columns:
+                         if k in ['volatility', 'maxdd', 'beta']: rank = df_met[k].abs().rank(pct=True, ascending=False)
+                         else: rank = df_met[k].rank(pct=True, ascending=True)
+                         f_sc = f_sc.add(rank*w, fill_value=0)
+                 scores = f_sc.to_dict()
+                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+        # --- EXECUTION ---
+        entry = i + 1
+        exit_i = min(i + 1 + holding_days, len(nav)-1)
+        
+        # Benchmark Return
+        b_ret = 0.0
+        if benchmark_series is not None:
+             try: b_ret = (benchmark_series.asof(nav.index[exit_i]) / benchmark_series.asof(nav.index[entry])) - 1
+             except: pass
+        
+        # Portfolio Return
+        port_ret = 0.0
+        hit_rate = 0.0
+        
+        if selected:
+            # If strategy found funds, calculate their return
+            period_ret_all_funds = (nav.iloc[exit_i] / nav.iloc[entry]) - 1
+            port_ret = period_ret_all_funds[selected].mean()
+            
+            # --- UPDATED HIT RATE LOGIC (MATCH AGAINST TOP TARGET N) ---
+            actual_top_target_funds = period_ret_all_funds.dropna().nlargest(target_n).index.tolist()
+            matches = len(set(selected).intersection(set(actual_top_target_funds)))
+            hit_rate = matches / top_n if top_n > 0 else 0
+        else:
+            port_ret = 0.0
+            hit_rate = 0.0
+        
+        cap *= (1 + (port_ret if not pd.isna(port_ret) else 0))
+        b_cap *= (1 + b_ret)
+        
+        history.append({
+            'date': date, 
+            'selected': selected, 
+            'return': port_ret,
+            'hit_rate': hit_rate,
+            'regime': regime_status
+        })
+        eq_curve.append({'date': nav.index[exit_i], 'value': cap})
+        bench_curve.append({'date': nav.index[exit_i], 'value': b_cap})
+
+    return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve)
+
+def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type, names_map, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
+    try: idx = nav_wide.index.get_loc(analysis_date)
+    except: return pd.DataFrame()
+    
+    entry_idx = idx + 1
+    exit_idx = entry_idx + holding_days
+    has_future = (exit_idx < len(nav_wide))
+    hist_data = get_lookback_data(nav_wide, analysis_date)
+    temp = []
+    
+    bench_rets = None
+    if benchmark_series is not None:
+        try:
+            b_slice = get_lookback_data(benchmark_series.to_frame(), analysis_date)
+            bench_rets = b_slice['nav'].pct_change().dropna()
+        except: pass
+
+    for col in nav_wide.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 126: continue
+        row = {'id': col, 'name': names_map.get(col, col)}
+        val = np.nan
+        rets = s.pct_change().dropna()
+        
+        if strategy_type == 'consistent_alpha':
+            wr = calculate_rolling_win_rate(s, benchmark_series.loc[:analysis_date]) if benchmark_series is not None else 0.5
+            ir = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+            val = (wr * 0.6) + (ir * 0.4) 
+        
+        elif strategy_type == 'omega':
+            val = calculate_omega_ratio(rets)
+            
+        elif strategy_type == 'capture_ratio':
+            val = calculate_capture_score(rets, bench_rets) if bench_rets is not None else 0
+            
+        elif strategy_type == 'martin':
+            val = calculate_martin_ratio(s)
+            
+        elif strategy_type == 'info_ratio':
+            val = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
+
+        elif strategy_type == 'momentum':
+            val = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
+        elif strategy_type == 'var': val = calculate_vol_adj_return(s)
+        elif strategy_type == 'sharpe': val = calculate_sharpe_ratio(rets)
+        elif strategy_type == 'sortino': val = calculate_sortino_ratio(rets)
+        elif strategy_type == 'custom':
+            score = 0
+            if custom_weights.get('sharpe',0): score += calculate_sharpe_ratio(rets) * custom_weights['sharpe']
+            val = score
+        elif strategy_type == 'ensemble':
+            val = 0 
+        
+        elif strategy_type == 'stable_momentum':
+             if len(s) > 200:
+                ret_12m = (s.iloc[-1] / s.iloc[0]) - 1
+                vol_12m = s.pct_change().std() * np.sqrt(252)
+                val = ret_12m / vol_12m if vol_12m > 0 else 0
+        
+        elif strategy_type == 'residual_momentum':
+             if benchmark_series is not None:
+                 b_slice_price = get_lookback_data(benchmark_series.to_frame(), analysis_date)['nav']
+                 val = calculate_residual_momentum(s, b_slice_price)
+
+        # Rank Fix: If Val is NaN, put it at bottom (-Inf) so rank works
+        row['Score'] = val if not np.isnan(val) else -float('inf')
+        
+        fwd_ret = np.nan
+        if has_future:
+            try: fwd_ret = (nav_wide[col].iloc[exit_idx] / nav_wide[col].iloc[entry_idx]) - 1
+            except: pass
+        row['Forward Return %'] = fwd_ret * 100
+        temp.append(row)
+        
+    df = pd.DataFrame(temp)
+    if df.empty: return df
+    
+    df['Strategy Rank'] = df['Score'].rank(ascending=False, method='min')
+    if has_future: df['Actual Rank'] = df['Forward Return %'].rank(ascending=False, method='min')
+    else: df['Actual Rank'] = np.nan
+    return df.sort_values('Strategy Rank')
+
+# ============================================================================
+# 6. UI COMPONENTS
+# ============================================================================
+
+def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold, cust_w, mom_cfg, ens_w=None):
+    hist, eq, ben = run_backtest(nav, strat_key, top_n, target_n, hold, cust_w, mom_cfg, nifty, ens_w)
+    
+    if not eq.empty:
+        start_date = eq.iloc[0]['date']
+        end_date = eq.iloc[-1]['date']
+        years = (end_date - start_date).days / 365.25
+        
+        strat_fin = eq.iloc[-1]['value']
+        strat_cagr = (strat_fin/100)**(1/years)-1 if years>0 else 0
+        
+        bench_fin = ben.iloc[-1]['value'] if not ben.empty else 100
+        bench_cagr = (bench_fin/100)**(1/years)-1 if years>0 and not ben.empty else 0
+        
+        avg_hit_rate = hist['hit_rate'].mean() if 'hit_rate' in hist.columns else 0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Strategy CAGR", f"{strat_cagr:.2%}")
+        c2.metric("Benchmark CAGR", f"{bench_cagr:.2%}")
+        c3.metric("Strategy Tot Ret", f"{strat_fin-100:.1f}%")
+        c4.metric("Benchmark Tot Ret", f"{bench_fin-100:.1f}%")
+        c5.metric("Avg Hit Rate", f"{avg_hit_rate:.1%}")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=eq['date'], y=eq['value'], name='Strategy', line=dict(color='green')))
+        if not ben.empty: 
+            fig.add_trace(go.Scatter(x=ben['date'], y=ben['value'], name='Benchmark (Nifty 100)', line=dict(color='red', dash='dot')))
+        
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{strat_key}")
+        
+        st.divider()
+        st.subheader("🔍 Deep Dive Snapshot")
+        
+        max_idx_possible = len(nav) - hold - 1
+        if max_idx_possible > 0:
+            max_valid_date = nav.index[max_idx_possible]
+            start_snapshot_date = nav.index.min() + pd.Timedelta(days=370)
+            
+            if start_snapshot_date < max_valid_date:
+                quarterly_dates = pd.date_range(start=start_snapshot_date, end=max_valid_date, freq='Q')
+                valid_dates = []
+                for d in quarterly_dates:
+                    trading_day = nav.index.asof(d)
+                    if pd.notna(trading_day):
+                        valid_dates.append(trading_day)
+                valid_dates = sorted(list(set(valid_dates)), reverse=True)
+                d_str = [d.strftime('%Y-%m-%d') for d in valid_dates]
+                
+                sel_d = st.selectbox("Snapshot Date (Quarterly)", d_str, key=f"dd_{strat_key}")
+                
+                if sel_d:
+                    df_snap = generate_snapshot_table(nav, pd.to_datetime(sel_d), hold, strat_key, maps, cust_w, mom_cfg, nifty, ens_w)
+                    if not df_snap.empty:
+                        df_snap = df_snap[['name', 'Strategy Rank', 'Forward Return %', 'Actual Rank', 'Score']]
+                        st.dataframe(
+                            df_snap.style.format({
+                                'Forward Return %': "{:.2f}%", 
+                                'Strategy Rank':"{:.0f}", 
+                                'Actual Rank':"{:.0f}",
+                                'Score': "{:.4f}"
+                            }).background_gradient(subset=['Forward Return %'], cmap='RdYlGn'), 
+                            use_container_width=True
+                        )
+            else:
+                st.warning("Not enough data history to generate quarterly snapshots.")
+        else:
+            st.warning("Holding period is too long relative to the available data history.")
+    else:
+        st.warning("No trades generated or insufficient data.")
+
+def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
+    st.markdown("### 🏆 Strategy Leaderboard")
+    
+    # ADDED NEW STRATEGIES HERE
+    strategies = {
+        'Stable Momentum': ('stable_momentum', {}, {}, None),
+        'Regime Switch (Smart)': ('regime_switch', {}, {}, None),
+        'Residual Momentum': ('residual_momentum', {}, {}, None),
+        'Consistent Alpha': ('consistent_alpha', {}, {}, None),
+        'Martin Ratio': ('martin', {}, {}, None),
+        'Ensemble': ('ensemble', {}, {'w_3m':0.33,'w_6m':0.33,'w_12m':0.33,'risk_adjust':True}, {'momentum':0.4, 'capture':0.6}),
+        'Momentum': ('momentum', {}, {'w_3m':0.33,'w_6m':0.33,'w_12m':0.33,'risk_adjust':True}, None),
+        'Sharpe': ('sharpe', {}, {}, None)
+    }
+    
+    results = []
+    fig = go.Figure()
+    
+    progress = st.progress(0)
+    for idx, (name, (key, cust, mom, ens)) in enumerate(strategies.items()):
+        hist, eq, ben = run_backtest(nav, key, top_n, target_n, hold, cust, mom, nifty, ens)
+        if not eq.empty:
+            start_date = eq.iloc[0]['date']
+            end_date = eq.iloc[-1]['date']
+            years = (end_date - start_date).days / 365.25
+            total_ret = eq.iloc[-1]['value'] - 100
+            cagr = (eq.iloc[-1]['value']/100)**(1/years)-1 if years>0 else 0
+            avg_acc = hist['hit_rate'].mean() * 100 if 'hit_rate' in hist.columns else 0
+            max_dd = calculate_max_dd(eq.set_index('date')['value'])
+            
+            results.append({
+                'Strategy': name,
+                'CAGR %': cagr * 100,
+                'Max Drawdown %': max_dd * 100,
+                'Hit Rate %': avg_acc
+            })
+            fig.add_trace(go.Scatter(x=eq['date'], y=eq['value'], name=name))
+        progress.progress((idx + 1) / len(strategies))
+
+    if 'ben' in locals() and not ben.empty:
+         fig.add_trace(go.Scatter(x=ben['date'], y=ben['value'], name='Benchmark (Nifty)', line=dict(color='black', dash='dot', width=2)))
+
+    if results:
+        df_res = pd.DataFrame(results).set_index('Strategy').sort_values('CAGR %', ascending=False)
+        st.caption(f"Hit Rate Logic: How many of the Top {top_n} selected funds landed in the Top {target_n} actual performers.")
+        st.dataframe(df_res.style.format("{:.2f}").background_gradient(subset=['CAGR %'], cmap='Greens'), use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="comparison_chart")
+
+def render_backtest_tab():
+    st.header("🚀 Strategy Backtester")
+    c1, c2, c3, c4 = st.columns(4)
+    cat = c1.selectbox("Category", list(FILE_MAPPING.keys()))
+    top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N, help="Funds to Buy")
+    target_n = c3.number_input("Target N Funds", 1, 20, DEFAULT_TARGET_N, help="Hit Rate Success Target")
+    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING) # Max 504 days
+    
+    with st.spinner("Loading Data..."):
+        nav, maps = load_fund_data_raw(cat)
+        nifty = load_nifty_data()
+    
+    if nav is None: st.error("Data not found."); return
+
+    # ADDED TABS FOR NEW STRATEGIES
+    tabs = st.tabs([
+        "🏆 Compare All", "🚦 Regime Switch", "⚓ Stable Mom", "📉 Residual Mom", 
+        "🧩 Ensemble", "🧠 Consistent Alpha", "🛡️ Martin", "🚀 Momentum", "⚖️ Sharpe", "Custom"
+    ])
+    
+    with tabs[0]:
+        # RUNS AUTOMATICALLY NOW (Button Removed)
+        render_comparison_tab(nav, maps, nifty, top_n, target_n, hold)
+
+    with tabs[1]:
+        st.info("🚦 **Regime Switch Strategy**")
+        st.markdown("**Logic:** Bull Market (>200 DMA) = **Momentum**. Bear Market (<200 DMA) = **Sharpe/Quality**.")
+        display_backtest_results(nav, maps, nifty, 'regime_switch', top_n, target_n, hold, {}, {})
+
+    with tabs[2]:
+        st.info("⚓ **Stable Momentum**")
+        st.markdown("**Logic:** 1. Get Top 2x funds by **Momentum**. 2. Filter that pool for **Lowest Drawdown**.")
+        display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, target_n, hold, {}, {})
+
+    with tabs[3]:
+        st.info("📉 **Residual Momentum**")
+        st.markdown("**Logic:** Ranking by the **Alpha Residuals** of a regression (Fund vs Benchmark). Removes market beta noise.")
+        display_backtest_results(nav, maps, nifty, 'residual_momentum', top_n, target_n, hold, {}, {})
+
+    with tabs[4]:
+        st.info("🧩 **Ensemble Strategy**")
+        display_backtest_results(nav, maps, nifty, 'ensemble', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, {'momentum':0.4, 'capture':0.6})
+
+    with tabs[5]:
+        st.info("🧠 **Consistent Alpha**")
+        display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, target_n, hold, {}, {})
+
+    with tabs[6]:
+        display_backtest_results(nav, maps, nifty, 'martin', top_n, target_n, hold, {}, {})
+        
+    with tabs[7]:
+        display_backtest_results(nav, maps, nifty, 'momentum', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True})
+
+    with tabs[8]:
+        display_backtest_results(nav, maps, nifty, 'sharpe', top_n, target_n, hold, {}, {})
+
+    with tabs[9]:
+        st.write("Custom weights...")
+        col_c1, col_c2, col_c3 = st.columns(3)
+        cw_sh = col_c1.slider("Sharpe Ratio", 0.0, 1.0, 0.5, key="c_sh")
+        cw_so = col_c2.slider("Sortino Ratio", 0.0, 1.0, 0.0, key="c_so")
+        cw_mo = col_c3.slider("Momentum", 0.0, 1.0, 0.5, key="c_mo")
+        col_c4, col_c5, col_c6 = st.columns(3)
+        cw_vo = col_c4.slider("Low Volatility", 0.0, 1.0, 0.0, key="c_vo")
+        cw_ir = col_c5.slider("Information Ratio", 0.0, 1.0, 0.0, key="c_ir")
+        cw_maxdd = col_c6.slider("Low Max Drawdown", 0.0, 1.0, 0.0, key="c_maxdd")
+        col_c7, col_c8, col_c9 = st.columns(3)
+        cw_ca = col_c7.slider("Calmar Ratio", 0.0, 1.0, 0.0, key="c_ca")
+        cw_alpha = col_c8.slider("Jensen's Alpha", 0.0, 1.0, 0.0, key="c_al")
+        cw_treynor = col_c9.slider("Treynor Ratio", 0.0, 1.0, 0.0, key="c_tr")
+        col_c10 = st.columns(1)[0]
+        cw_beta = col_c10.slider("Low Beta", 0.0, 1.0, 0.0, key="c_be")
+        
+        raw_weights = {
+            'sharpe': cw_sh, 'sortino': cw_so, 'momentum': cw_mo, 
+            'volatility': cw_vo, 'info_ratio': cw_ir, 'maxdd': cw_maxdd,
+            'calmar': cw_ca, 'alpha': cw_alpha, 'treynor': cw_treynor, 'beta': cw_beta
+        }
+        total_weight = sum(raw_weights.values())
+        
+        if total_weight > 0:
+            final_weights = {k: v / total_weight for k, v in raw_weights.items()}
+            m_c = {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}
+            display_backtest_results(nav, maps, nifty, 'custom', top_n, target_n, hold, final_weights, m_c)
+        else:
+            st.warning("Please select at least one weight > 0")
+
+def main():
+    t1, t2 = st.tabs(["📂 Category Explorer", "🚀 Strategy Backtester"])
+    with t1: render_explorer_tab()
+    with t2: render_backtest_tab()
+
+if __name__ == "__main__":
+    main()
