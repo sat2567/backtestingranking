@@ -192,7 +192,7 @@ def calculate_rolling_win_rate(fund_series, bench_series, window=252):
 def calculate_residual_momentum(series, benchmark_series):
     """
     Calculates Idiosyncratic Momentum (Pure Alpha Trend).
-    FIXED: Stricter data alignment to prevent noise.
+    Updated to handle infinity and zero errors.
     """
     # 1. Clean Data
     s_ret = series.pct_change().dropna()
@@ -201,24 +201,38 @@ def calculate_residual_momentum(series, benchmark_series):
     # 2. Strict Alignment (Inner Join)
     aligned_data = pd.concat([s_ret, b_ret], axis=1, join='inner').dropna()
     
-    # 3. Check for sufficient history (at least 60 trading days = ~3 months)
+    # 3. Check for sufficient history
     if len(aligned_data) < 60: return np.nan
     
     y = aligned_data.iloc[:, 0] # Fund Returns
     x = aligned_data.iloc[:, 1] # Bench Returns
     
+    # 3.5 Check for constant inputs (avoids regression errors)
+    if x.std() == 0 or y.std() == 0: return np.nan
+    
     # 4. Regression
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
     
+    # Check if regression outputs are valid
+    if not np.isfinite(slope) or not np.isfinite(intercept): return np.nan
+
     # 5. Residuals (Actual - Predicted)
     expected_return = (x * slope) + intercept
     residuals = y - expected_return
     
     # 6. Score: Information Ratio of Residuals
     res_std = residuals.std()
-    if res_std == 0: return 0
     
-    return residuals.mean() / res_std
+    # Handle zero division or NaN std
+    if res_std == 0 or pd.isna(res_std): return np.nan 
+    
+    score = residuals.mean() / res_std
+    
+    # Final sanity checks
+    if not np.isfinite(score): return np.nan
+    if score == 0: return np.nan # Treat exact 0 as invalid if preferred
+    
+    return score
 
 def get_market_regime(benchmark_series, current_date, window=200):
     """Determines if Market is Bull (Price > 200 DMA) or Bear."""
@@ -428,7 +442,9 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                         # Pass raw price series slice of benchmark
                         b_slice_price = get_lookback_data(benchmark_series.to_frame(), date)['nav']
                         val = calculate_residual_momentum(s, b_slice_price)
-                        if not pd.isna(val): scores[col] = val
+                        # Updated check: exclude NaN, Inf, and Zero
+                        if not pd.isna(val) and np.isfinite(val) and val != 0:
+                            scores[col] = val
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
         # B. STABLE MOMENTUM
@@ -464,7 +480,9 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                     else:
                         val = calculate_sharpe_ratio(s.pct_change().dropna())
                     
-                    if not pd.isna(val): scores[col] = val
+                    # Updated check: exclude NaN, Inf, and Zero
+                    if not pd.isna(val) and np.isfinite(val) and val != 0:
+                         scores[col] = val
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
         # D. ENSEMBLE
