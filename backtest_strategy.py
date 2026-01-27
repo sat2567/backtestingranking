@@ -5,6 +5,7 @@ import os
 import warnings
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from scipy import stats
 
 warnings.filterwarnings('ignore')
 
@@ -55,7 +56,9 @@ def clean_weekday_data(df):
         df = df.ffill(limit=5)
     return df
 
-# --- METRICS ---
+# ============================================================================
+# 3. EXISTING METRICS (keeping all your originals)
+# ============================================================================
 
 def calculate_sharpe_ratio(returns):
     if len(returns) < 10 or returns.std() == 0: return np.nan
@@ -158,11 +161,8 @@ def calculate_flexible_momentum(series, w_3m, w_6m, w_12m, use_risk_adjust=False
         date_1y_ago = current_date - pd.Timedelta(days=365)
         hist_vol_data = series[series.index >= date_1y_ago]
         if len(hist_vol_data) < 20: return np.nan
-        
-        # Volatility clamp to prevent Infinity
         vol = hist_vol_data.pct_change().dropna().std() * np.sqrt(TRADING_DAYS_YEAR)
         if vol < 1e-6: return np.nan
-        
         return raw_score / vol
     return raw_score
 
@@ -192,20 +192,14 @@ def calculate_rolling_win_rate(fund_series, bench_series, window=252):
 def calculate_beta_alpha_treynor(fund_returns, bench_returns):
     common_idx = fund_returns.index.intersection(bench_returns.index)
     if len(common_idx) < 30: return np.nan, np.nan, np.nan
-    
     y = fund_returns.loc[common_idx]
     x = bench_returns.loc[common_idx]
-    
     cov_matrix = np.cov(y, x)
     beta = cov_matrix[0, 1] / cov_matrix[1, 1]
-    
     mean_fund = y.mean() * TRADING_DAYS_YEAR
     mean_bench = x.mean() * TRADING_DAYS_YEAR
-    
     alpha = mean_fund - (RISK_FREE_RATE + beta * (mean_bench - RISK_FREE_RATE))
-    
     treynor = (mean_fund - RISK_FREE_RATE) / beta if beta != 0 else np.nan
-    
     return beta, alpha, treynor
 
 def calculate_calmar_ratio(series, current_date):
@@ -213,20 +207,633 @@ def calculate_calmar_ratio(series, current_date):
     three_years_ago = current_date - pd.Timedelta(days=365*3)
     sub = series[series.index >= three_years_ago]
     if len(sub) < 100: sub = series 
-    
     max_dd = calculate_max_dd(sub)
     if max_dd == 0 or pd.isna(max_dd): return np.nan
-    
     start_val = sub.iloc[0]
     end_val = sub.iloc[-1]
     years = (sub.index[-1] - sub.index[0]).days / 365.25
     if years <= 0: return np.nan
     cagr = (end_val / start_val) ** (1/years) - 1
-    
     return cagr / abs(max_dd)
 
 # ============================================================================
-# 3. DATA LOADING
+# 4. NEW HIGH-HIT-RATE STRATEGIES
+# ============================================================================
+
+def calculate_rank_persistence(series, nav_df, lookback_quarters=4):
+    """
+    Funds that consistently rank in top quartile tend to persist.
+    This captures "skill" vs "luck" - skilled managers maintain ranks.
+    """
+    if len(series) < 252: return np.nan
+    
+    current_date = series.index[-1]
+    persist_score = 0
+    valid_quarters = 0
+    
+    for q in range(1, lookback_quarters + 1):
+        q_start = current_date - pd.Timedelta(days=91 * q)
+        q_end = current_date - pd.Timedelta(days=91 * (q - 1))
+        
+        try:
+            # Get returns for all funds in that quarter
+            idx_start = nav_df.index.asof(q_start)
+            idx_end = nav_df.index.asof(q_end)
+            
+            if pd.isna(idx_start) or pd.isna(idx_end): continue
+            
+            q_returns = (nav_df.loc[idx_end] / nav_df.loc[idx_start]) - 1
+            q_returns = q_returns.dropna()
+            
+            if len(q_returns) < 5: continue
+            
+            # Get rank for this fund
+            fund_id = series.name
+            if fund_id not in q_returns.index: continue
+            
+            rank_pct = q_returns.rank(pct=True, ascending=True)[fund_id]
+            
+            # Score: top quartile = 1, second = 0.5, third = 0, bottom = -0.5
+            if rank_pct >= 0.75: persist_score += 1.0
+            elif rank_pct >= 0.5: persist_score += 0.5
+            elif rank_pct >= 0.25: persist_score += 0.0
+            else: persist_score -= 0.5
+            
+            valid_quarters += 1
+        except:
+            continue
+    
+    if valid_quarters == 0: return np.nan
+    return persist_score / valid_quarters
+
+
+def calculate_drawdown_recovery_speed(series):
+    """
+    Funds that recover quickly from drawdowns are often better managed.
+    Fast recovery = strong fund selection/risk management.
+    """
+    if len(series) < 252: return np.nan
+    
+    cum_max = series.expanding(min_periods=1).max()
+    drawdowns = (series / cum_max) - 1
+    
+    # Find significant drawdowns (> 5%)
+    in_drawdown = False
+    dd_start = None
+    recovery_times = []
+    
+    for i, (date, dd) in enumerate(drawdowns.items()):
+        if not in_drawdown and dd < -0.05:
+            in_drawdown = True
+            dd_start = i
+        elif in_drawdown and dd >= -0.01:  # Recovered
+            recovery_time = i - dd_start
+            recovery_times.append(recovery_time)
+            in_drawdown = False
+    
+    if not recovery_times: return np.nan
+    
+    # Faster recovery = higher score (inverse of avg recovery time)
+    avg_recovery = np.mean(recovery_times)
+    if avg_recovery == 0: return np.nan
+    
+    return 1.0 / avg_recovery * 100  # Scale up
+
+
+def calculate_consistency_score(series, window=63):
+    """
+    Measures how consistently a fund outperforms its own rolling average.
+    Consistent funds are more predictable.
+    """
+    if len(series) < window * 2: return np.nan
+    
+    returns = series.pct_change().dropna()
+    rolling_avg = returns.rolling(window=window).mean()
+    
+    # Count how often daily return exceeds rolling average
+    aligned = pd.concat([returns, rolling_avg], axis=1).dropna()
+    if len(aligned) < window: return np.nan
+    
+    aligned.columns = ['ret', 'avg']
+    above_avg = (aligned['ret'] > aligned['avg']).sum()
+    
+    return above_avg / len(aligned)
+
+
+def calculate_downside_consistency(fund_rets, bench_rets):
+    """
+    Measures how consistently fund protects in down markets.
+    More consistent protection = more predictable future protection.
+    """
+    common_idx = fund_rets.index.intersection(bench_rets.index)
+    if len(common_idx) < 60: return np.nan
+    
+    f = fund_rets.loc[common_idx]
+    b = bench_rets.loc[common_idx]
+    
+    # Look at worst 20% of benchmark days
+    threshold = b.quantile(0.2)
+    worst_days = b[b <= threshold]
+    
+    if len(worst_days) < 10: return np.nan
+    
+    # For each worst day, did fund do better than benchmark?
+    protection_count = 0
+    for date in worst_days.index:
+        if f.loc[date] > b.loc[date]:
+            protection_count += 1
+    
+    return protection_count / len(worst_days)
+
+
+def calculate_momentum_quality(series):
+    """
+    Not just momentum, but QUALITY of momentum.
+    High R-squared trend = more likely to continue.
+    """
+    if len(series) < 126: return np.nan
+    
+    # Use last 6 months
+    recent = series.iloc[-126:]
+    
+    # Fit linear regression
+    x = np.arange(len(recent))
+    y = np.log(recent.values + 1e-10)  # Log prices
+    
+    try:
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    except:
+        return np.nan
+    
+    r_squared = r_value ** 2
+    
+    # Score = slope * r_squared (strong uptrend with high fit)
+    # Annualize slope
+    annual_slope = slope * 252
+    
+    return annual_slope * r_squared
+
+
+def calculate_smart_beta_tilt(series, bench_series):
+    """
+    Funds with positive but moderate beta tend to outperform.
+    Too high beta = too much market dependency.
+    Too low beta = missing market returns.
+    Optimal is around 0.8-1.1
+    """
+    if len(series) < 126: return np.nan
+    
+    fund_ret = series.pct_change().dropna()
+    bench_ret = bench_series.pct_change().dropna()
+    
+    common_idx = fund_ret.index.intersection(bench_ret.index)
+    if len(common_idx) < 60: return np.nan
+    
+    f = fund_ret.loc[common_idx]
+    b = bench_ret.loc[common_idx]
+    
+    # Calculate beta
+    cov = np.cov(f, b)
+    beta = cov[0, 1] / cov[1, 1]
+    
+    # Optimal beta range penalty
+    # Best score at beta = 0.95, penalize deviation
+    optimal_beta = 0.95
+    beta_penalty = abs(beta - optimal_beta)
+    
+    # Also factor in alpha
+    alpha = f.mean() - beta * b.mean()
+    
+    # Combined score: high alpha, beta close to optimal
+    score = alpha * 252 - beta_penalty * 0.5
+    
+    return score
+
+
+def calculate_volatility_regime_adaptability(series, lookback=252):
+    """
+    Funds that adapt well to changing volatility regimes 
+    tend to perform better in the future.
+    """
+    if len(series) < lookback + 63: return np.nan
+    
+    returns = series.pct_change().dropna()
+    
+    # Split into high-vol and low-vol periods
+    rolling_vol = returns.rolling(21).std()
+    median_vol = rolling_vol.median()
+    
+    high_vol_periods = returns[rolling_vol > median_vol]
+    low_vol_periods = returns[rolling_vol <= median_vol]
+    
+    if len(high_vol_periods) < 30 or len(low_vol_periods) < 30:
+        return np.nan
+    
+    # Sharpe in each regime
+    high_vol_sharpe = high_vol_periods.mean() / high_vol_periods.std() if high_vol_periods.std() > 0 else 0
+    low_vol_sharpe = low_vol_periods.mean() / low_vol_periods.std() if low_vol_periods.std() > 0 else 0
+    
+    # Good funds perform well in BOTH regimes
+    # Use geometric mean to penalize poor performance in either
+    if high_vol_sharpe <= 0 or low_vol_sharpe <= 0:
+        return (high_vol_sharpe + low_vol_sharpe) / 2
+    
+    return np.sqrt(high_vol_sharpe * low_vol_sharpe)
+
+
+def calculate_peer_relative_strength(series, nav_df, lookback=126):
+    """
+    Relative strength vs peers, not just absolute momentum.
+    Funds consistently in top half of peers tend to stay there.
+    """
+    if len(series) < lookback: return np.nan
+    
+    current_date = series.index[-1]
+    
+    # Calculate returns for all funds
+    try:
+        idx_start = nav_df.index.asof(current_date - pd.Timedelta(days=lookback))
+        idx_end = current_date
+        
+        period_returns = (nav_df.loc[idx_end] / nav_df.loc[idx_start]) - 1
+        period_returns = period_returns.dropna()
+        
+        if len(period_returns) < 5: return np.nan
+        
+        fund_id = series.name
+        if fund_id not in period_returns.index: return np.nan
+        
+        # Percentile rank among peers
+        rank_pct = period_returns.rank(pct=True, ascending=True)[fund_id]
+        
+        return rank_pct
+    except:
+        return np.nan
+
+
+def calculate_max_gain_capture(fund_rets, bench_rets):
+    """
+    Focus on capturing BIG up days, not average up days.
+    Funds that capture best days often have better stock selection.
+    """
+    common_idx = fund_rets.index.intersection(bench_rets.index)
+    if len(common_idx) < 60: return np.nan
+    
+    f = fund_rets.loc[common_idx]
+    b = bench_rets.loc[common_idx]
+    
+    # Look at best 10% of benchmark days
+    threshold = b.quantile(0.9)
+    best_days = b[b >= threshold]
+    
+    if len(best_days) < 5: return np.nan
+    
+    # How much did fund capture on these best days?
+    fund_on_best = f.loc[best_days.index]
+    bench_on_best = best_days
+    
+    capture_ratio = fund_on_best.sum() / bench_on_best.sum() if bench_on_best.sum() != 0 else 0
+    
+    return capture_ratio
+
+
+def calculate_trend_following_score(series, short_window=50, long_window=200):
+    """
+    Funds above their moving averages tend to continue outperforming.
+    Multiple timeframe confirmation = stronger signal.
+    """
+    if len(series) < long_window + 20: return np.nan
+    
+    current_price = series.iloc[-1]
+    ma_short = series.rolling(short_window).mean().iloc[-1]
+    ma_long = series.rolling(long_window).mean().iloc[-1]
+    
+    score = 0
+    
+    # Price above short MA
+    if current_price > ma_short:
+        score += 0.4
+    
+    # Price above long MA
+    if current_price > ma_long:
+        score += 0.3
+    
+    # Short MA above long MA (golden cross territory)
+    if ma_short > ma_long:
+        score += 0.3
+    
+    # Bonus: both MAs trending up
+    ma_short_prev = series.rolling(short_window).mean().iloc[-21]
+    ma_long_prev = series.rolling(long_window).mean().iloc[-21]
+    
+    if ma_short > ma_short_prev:
+        score += 0.1
+    if ma_long > ma_long_prev:
+        score += 0.1
+    
+    return score
+
+
+def calculate_information_coefficient(series, nav_df, forward_window=63):
+    """
+    Historical predictive accuracy - how well did past rankings
+    predict future performance? Higher IC = more predictable fund.
+    """
+    if len(series) < 252 + forward_window: return np.nan
+    
+    # This requires looking at historical predictions
+    # We'll compute rolling rank correlations
+    
+    current_date = series.index[-1]
+    correlations = []
+    
+    for lookback_months in range(3, 12):
+        try:
+            past_date = current_date - pd.Timedelta(days=30 * lookback_months)
+            
+            # Ranks at past_date based on prior 6m return
+            prior_start = past_date - pd.Timedelta(days=126)
+            
+            idx_prior_start = nav_df.index.asof(prior_start)
+            idx_past = nav_df.index.asof(past_date)
+            idx_future = nav_df.index.asof(past_date + pd.Timedelta(days=forward_window))
+            
+            if any(pd.isna([idx_prior_start, idx_past, idx_future])): continue
+            
+            prior_returns = (nav_df.loc[idx_past] / nav_df.loc[idx_prior_start]) - 1
+            future_returns = (nav_df.loc[idx_future] / nav_df.loc[idx_past]) - 1
+            
+            # Correlation between prior and future returns
+            common = prior_returns.dropna().index.intersection(future_returns.dropna().index)
+            if len(common) < 5: continue
+            
+            corr = prior_returns[common].corr(future_returns[common])
+            if not pd.isna(corr):
+                correlations.append(corr)
+        except:
+            continue
+    
+    if not correlations: return np.nan
+    
+    # Average correlation (higher = more predictable category)
+    avg_ic = np.mean(correlations)
+    
+    # Fund's relative strength in predictable category
+    fund_id = series.name
+    try:
+        recent_6m_ret = (series.iloc[-1] / series.iloc[-126]) - 1
+        all_6m_ret = (nav_df.iloc[-1] / nav_df.iloc[-126]) - 1
+        rank_pct = all_6m_ret.dropna().rank(pct=True, ascending=True).get(fund_id, 0.5)
+    except:
+        rank_pct = 0.5
+    
+    # High IC category + high rank = good signal
+    return avg_ic * rank_pct if avg_ic > 0 else rank_pct * 0.5
+
+
+# ============================================================================
+# 5. NEW COMPOSITE STRATEGIES
+# ============================================================================
+
+def strategy_quality_momentum(hist_data, nav_df, bench_rets, top_n):
+    """
+    Strategy: Quality Momentum
+    Combines momentum quality (R-squared trend) with consistency.
+    Rationale: Smooth uptrends more likely to continue than volatile ones.
+    """
+    scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 200: continue
+        
+        mom_quality = calculate_momentum_quality(s)
+        consistency = calculate_consistency_score(s)
+        
+        if pd.isna(mom_quality) or pd.isna(consistency): continue
+        
+        # Combined score
+        scores[col] = mom_quality * 0.6 + consistency * 0.4
+    
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+def strategy_persistent_alpha(hist_data, nav_df, bench_series, bench_rets, top_n):
+    """
+    Strategy: Persistent Alpha
+    Funds with consistent outperformance across multiple periods.
+    Rationale: Luck doesn't persist; skill does.
+    """
+    scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        s.name = col
+        if len(s) < 252: continue
+        
+        # Rank persistence
+        persist = calculate_rank_persistence(s, hist_data)
+        
+        # Downside consistency
+        if bench_rets is not None and len(bench_rets) > 60:
+            rets = s.pct_change().dropna()
+            down_consist = calculate_downside_consistency(rets, bench_rets)
+        else:
+            down_consist = 0.5
+        
+        if pd.isna(persist): continue
+        
+        scores[col] = persist * 0.5 + (down_consist if not pd.isna(down_consist) else 0.5) * 0.5
+    
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+def strategy_regime_adaptive(hist_data, nav_df, bench_series, bench_rets, top_n):
+    """
+    Strategy: Regime Adaptive
+    Funds that perform in both high and low volatility environments.
+    Rationale: Robust across market conditions = better future performance.
+    """
+    scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 252: continue
+        
+        adaptability = calculate_volatility_regime_adaptability(s)
+        
+        if pd.isna(adaptability): continue
+        
+        # Also factor in recovery speed
+        recovery = calculate_drawdown_recovery_speed(s)
+        
+        if pd.isna(recovery):
+            scores[col] = adaptability
+        else:
+            scores[col] = adaptability * 0.6 + min(recovery, 10) / 10 * 0.4
+    
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+def strategy_trend_confirmation(hist_data, nav_df, bench_series, bench_rets, top_n):
+    """
+    Strategy: Multi-Timeframe Trend Confirmation
+    Strong trend across multiple timeframes.
+    Rationale: Confirmed trends have higher probability of continuation.
+    """
+    scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 252: continue
+        
+        trend_score = calculate_trend_following_score(s)
+        
+        # Also check peer relative strength
+        s.name = col
+        peer_strength = calculate_peer_relative_strength(s, hist_data)
+        
+        if pd.isna(trend_score): continue
+        
+        if pd.isna(peer_strength):
+            scores[col] = trend_score
+        else:
+            scores[col] = trend_score * 0.5 + peer_strength * 0.5
+    
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+def strategy_best_day_capture(hist_data, nav_df, bench_series, bench_rets, top_n):
+    """
+    Strategy: Best Day Capture
+    Funds that capture the biggest up days.
+    Rationale: Missing best days kills returns; funds that capture them outperform.
+    """
+    if bench_rets is None: return []
+    
+    scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 126: continue
+        
+        rets = s.pct_change().dropna()
+        
+        max_gain = calculate_max_gain_capture(rets, bench_rets)
+        
+        if pd.isna(max_gain): continue
+        
+        # Also factor in overall capture ratio
+        capture = calculate_capture_score(rets, bench_rets)
+        
+        if pd.isna(capture):
+            scores[col] = max_gain
+        else:
+            scores[col] = max_gain * 0.6 + capture * 0.4
+    
+    return sorted(scores, key=scores.get, reverse=True)[:top_n]
+
+
+def strategy_low_volatility_momentum(hist_data, nav_df, bench_rets, top_n):
+    """
+    Strategy: Low Volatility Momentum
+    Momentum but filtered for lower volatility funds.
+    Rationale: Low vol + momentum = more sustainable outperformance.
+    """
+    # First pass: get momentum scores
+    mom_scores = {}
+    vol_scores = {}
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        if len(s) < 200: continue
+        
+        mom = calculate_flexible_momentum(s, 0.4, 0.4, 0.2, False)
+        vol = calculate_volatility(s.pct_change().dropna())
+        
+        if not pd.isna(mom): mom_scores[col] = mom
+        if not pd.isna(vol): vol_scores[col] = vol
+    
+    if not mom_scores or not vol_scores: return []
+    
+    # Get top 2x by momentum
+    top_mom = sorted(mom_scores, key=mom_scores.get, reverse=True)[:top_n * 3]
+    
+    # Filter for lowest volatility among momentum leaders
+    vol_filtered = {k: vol_scores.get(k, float('inf')) for k in top_mom if k in vol_scores}
+    
+    return sorted(vol_filtered, key=vol_filtered.get)[:top_n]
+
+
+def strategy_composite_predictor(hist_data, nav_df, bench_series, bench_rets, top_n):
+    """
+    Strategy: Composite Predictor
+    Combines multiple predictive signals with empirical weights.
+    Uses ensemble of best performing indicators.
+    """
+    fund_scores = pd.DataFrame(index=nav_df.columns)
+    
+    for col in nav_df.columns:
+        s = hist_data[col].dropna()
+        s.name = col
+        if len(s) < 252: continue
+        
+        rets = s.pct_change().dropna()
+        
+        scores = {}
+        
+        # 1. Quality Momentum (20%)
+        qm = calculate_momentum_quality(s)
+        if not pd.isna(qm): scores['qm'] = qm
+        
+        # 2. Rank Persistence (20%)
+        rp = calculate_rank_persistence(s, hist_data)
+        if not pd.isna(rp): scores['rp'] = rp
+        
+        # 3. Regime Adaptability (15%)
+        ra = calculate_volatility_regime_adaptability(s)
+        if not pd.isna(ra): scores['ra'] = ra
+        
+        # 4. Trend Score (15%)
+        ts = calculate_trend_following_score(s)
+        if not pd.isna(ts): scores['ts'] = ts
+        
+        # 5. Downside Consistency (15%)
+        if bench_rets is not None:
+            dc = calculate_downside_consistency(rets, bench_rets)
+            if not pd.isna(dc): scores['dc'] = dc
+        
+        # 6. Sharpe (15%)
+        sh = calculate_sharpe_ratio(rets)
+        if not pd.isna(sh): scores['sh'] = sh
+        
+        fund_scores.loc[col, 'count'] = len(scores)
+        
+        for k, v in scores.items():
+            fund_scores.loc[col, k] = v
+    
+    # Normalize and combine
+    fund_scores = fund_scores.dropna(subset=['count'])
+    if fund_scores.empty: return []
+    
+    # Only keep funds with at least 4 valid signals
+    fund_scores = fund_scores[fund_scores['count'] >= 4]
+    
+    # Rank-based combination
+    final_score = pd.Series(0.0, index=fund_scores.index)
+    
+    weights = {'qm': 0.20, 'rp': 0.20, 'ra': 0.15, 'ts': 0.15, 'dc': 0.15, 'sh': 0.15}
+    
+    for col, w in weights.items():
+        if col in fund_scores.columns:
+            ranks = fund_scores[col].rank(pct=True, ascending=True, na_option='bottom')
+            final_score += ranks * w
+    
+    return final_score.nlargest(top_n).index.tolist()
+
+
+# ============================================================================
+# 6. DATA LOADING (Same as original)
 # ============================================================================
 
 @st.cache_data
@@ -271,8 +878,9 @@ def load_nifty_data():
         return clean_weekday_data(df).squeeze()
     except: return None
 
+
 # ============================================================================
-# 4. EXPLORER LOGIC
+# 7. EXPLORER LOGIC (Same as original)
 # ============================================================================
 
 def calculate_analytics_metrics(nav_df, scheme_map, benchmark_series=None):
@@ -374,8 +982,9 @@ def render_explorer_tab():
                 df = calculate_quarterly_ranks(nav, maps)
                 st.dataframe(df.style.format({'% Time in Top 5': '{:.1f}%'}, na_rep=""), use_container_width=True, height=600)
 
+
 # ============================================================================
-# 5. BACKTESTER LOGIC
+# 8. UPDATED BACKTESTER WITH NEW STRATEGIES
 # ============================================================================
 
 def get_lookback_data(nav, analysis_date):
@@ -383,9 +992,9 @@ def get_lookback_data(nav, analysis_date):
     start_date = analysis_date - pd.Timedelta(days=max_days)
     return nav[(nav.index >= start_date) & (nav.index < analysis_date)]
 
+
 def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
     
-    # --- 1. DYNAMIC TIMELINE HANDLING ---
     start_date = nav.index.min() + pd.Timedelta(days=370)
     if start_date >= nav.index.max(): 
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -412,10 +1021,36 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
         scores = {}
         selected = []
 
-        # --- STRATEGY SELECTION LOGIC ---
+        # =============================================
+        # NEW STRATEGIES
+        # =============================================
+        
+        if strategy_type == 'quality_momentum':
+            selected = strategy_quality_momentum(hist, nav, bench_rets, top_n)
+        
+        elif strategy_type == 'persistent_alpha':
+            selected = strategy_persistent_alpha(hist, nav, benchmark_series, bench_rets, top_n)
+        
+        elif strategy_type == 'regime_adaptive':
+            selected = strategy_regime_adaptive(hist, nav, benchmark_series, bench_rets, top_n)
+        
+        elif strategy_type == 'trend_confirmation':
+            selected = strategy_trend_confirmation(hist, nav, benchmark_series, bench_rets, top_n)
+        
+        elif strategy_type == 'best_day_capture':
+            selected = strategy_best_day_capture(hist, nav, benchmark_series, bench_rets, top_n)
+        
+        elif strategy_type == 'low_vol_momentum':
+            selected = strategy_low_volatility_momentum(hist, nav, bench_rets, top_n)
+        
+        elif strategy_type == 'composite_predictor':
+            selected = strategy_composite_predictor(hist, nav, benchmark_series, bench_rets, top_n)
 
-        # A. STABLE MOMENTUM
-        if strategy_type == 'stable_momentum':
+        # =============================================
+        # EXISTING STRATEGIES (unchanged)
+        # =============================================
+
+        elif strategy_type == 'stable_momentum':
             mom_scores = {}
             for col in nav.columns:
                 s = hist[col].dropna()
@@ -431,7 +1066,6 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 if not pd.isna(dd): dd_scores[col] = dd
             selected = sorted(dd_scores, key=dd_scores.get, reverse=True)[:top_n]
 
-        # B. ENSEMBLE
         elif strategy_type == 'ensemble':
             fund_ranks = pd.DataFrame(index=nav.columns)
             
@@ -509,7 +1143,6 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
             scores = final_score.to_dict()
             selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # C. CONSISTENT ALPHA
         elif strategy_type == 'consistent_alpha':
             temp_rows = []
             for col in nav.columns:
@@ -525,7 +1158,6 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 scores = final_score.to_dict()
                 selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # D. SINGLE METRICS
         elif strategy_type in ['martin', 'omega', 'capture_ratio', 'info_ratio', 'momentum', 'sharpe', 'sortino', 'var']:
              for col in nav.columns:
                 s = hist[col].dropna()
@@ -545,7 +1177,6 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
                 if not pd.isna(val): scores[col] = val
              selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
 
-        # E. CUSTOM WEIGHTS
         elif strategy_type == 'custom':
              temp_data = []
              for col in nav.columns:
@@ -595,11 +1226,9 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
         hit_rate = 0.0
         
         if selected:
-            # If strategy found funds, calculate their return
             period_ret_all_funds = (nav.iloc[exit_i] / nav.iloc[entry]) - 1
             port_ret = period_ret_all_funds[selected].mean()
             
-            # --- UPDATED HIT RATE LOGIC (MATCH AGAINST TOP TARGET N) ---
             actual_top_target_funds = period_ret_all_funds.dropna().nlargest(target_n).index.tolist()
             matches = len(set(selected).intersection(set(actual_top_target_funds)))
             hit_rate = matches / top_n if top_n > 0 else 0
@@ -620,6 +1249,7 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
         bench_curve.append({'date': nav.index[exit_i], 'value': b_cap})
 
     return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve)
+
 
 def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type, names_map, custom_weights, momentum_config, benchmark_series, ensemble_weights=None):
     try: idx = nav_wide.index.get_loc(analysis_date)
@@ -644,24 +1274,44 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
         row = {'id': col, 'name': names_map.get(col, col)}
         val = np.nan
         rets = s.pct_change().dropna()
+        s.name = col
         
-        if strategy_type == 'consistent_alpha':
+        # New strategies
+        if strategy_type == 'quality_momentum':
+            val = calculate_momentum_quality(s)
+        elif strategy_type == 'persistent_alpha':
+            val = calculate_rank_persistence(s, hist_data)
+        elif strategy_type == 'regime_adaptive':
+            val = calculate_volatility_regime_adaptability(s)
+        elif strategy_type == 'trend_confirmation':
+            val = calculate_trend_following_score(s)
+        elif strategy_type == 'best_day_capture' and bench_rets is not None:
+            val = calculate_max_gain_capture(rets, bench_rets)
+        elif strategy_type == 'low_vol_momentum':
+            mom = calculate_flexible_momentum(s, 0.4, 0.4, 0.2, False)
+            vol = calculate_volatility(rets)
+            if not pd.isna(mom) and not pd.isna(vol) and vol > 0:
+                val = mom / vol
+        elif strategy_type == 'composite_predictor':
+            # For snapshot, use simplified version
+            qm = calculate_momentum_quality(s) or 0
+            rp = calculate_rank_persistence(s, hist_data) or 0
+            ts = calculate_trend_following_score(s) or 0
+            val = qm * 0.4 + rp * 0.3 + ts * 0.3
+        
+        # Existing strategies
+        elif strategy_type == 'consistent_alpha':
             wr = calculate_rolling_win_rate(s, benchmark_series.loc[:analysis_date]) if benchmark_series is not None else 0.5
             ir = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
             val = (wr * 0.6) + (ir * 0.4) 
-        
         elif strategy_type == 'omega':
             val = calculate_omega_ratio(rets)
-            
         elif strategy_type == 'capture_ratio':
             val = calculate_capture_score(rets, bench_rets) if bench_rets is not None else 0
-            
         elif strategy_type == 'martin':
             val = calculate_martin_ratio(s)
-            
         elif strategy_type == 'info_ratio':
             val = calculate_information_ratio(rets, bench_rets) if bench_rets is not None else 0
-
         elif strategy_type == 'momentum':
             val = calculate_flexible_momentum(s, momentum_config['w_3m'], momentum_config['w_6m'], momentum_config['w_12m'], momentum_config['risk_adjust'])
         elif strategy_type == 'var': val = calculate_vol_adj_return(s)
@@ -673,14 +1323,12 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
             val = score
         elif strategy_type == 'ensemble':
             val = 0 
-        
         elif strategy_type == 'stable_momentum':
              if len(s) > 200:
                 ret_12m = (s.iloc[-1] / s.iloc[0]) - 1
                 vol_12m = s.pct_change().std() * np.sqrt(252)
                 val = ret_12m / vol_12m if vol_12m > 0 else 0
 
-        # Rank Fix: If Val is NaN, put it at bottom (-Inf) so rank works
         row['Score'] = val if not np.isnan(val) else -float('inf')
         
         fwd_ret = np.nan
@@ -698,11 +1346,15 @@ def generate_snapshot_table(nav_wide, analysis_date, holding_days, strategy_type
     else: df['Actual Rank'] = np.nan
     return df.sort_values('Strategy Rank')
 
+
 # ============================================================================
-# 6. UI COMPONENTS
+# 9. UI COMPONENTS
 # ============================================================================
 
-def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold, cust_w, mom_cfg, ens_w=None):
+def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold, cust_w, mom_cfg, ens_w=None, description=""):
+    if description:
+        st.info(description)
+    
     hist, eq, ben = run_backtest(nav, strat_key, top_n, target_n, hold, cust_w, mom_cfg, nifty, ens_w)
     
     if not eq.empty:
@@ -772,11 +1424,21 @@ def display_backtest_results(nav, maps, nifty, strat_key, top_n, target_n, hold,
     else:
         st.warning("No trades generated or insufficient data.")
 
+
 def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
-    st.markdown("### 🏆 Strategy Leaderboard")
+    st.markdown("### 🏆 Strategy Leaderboard (Including New High-Hit-Rate Strategies)")
     
-    # REMOVED Regime Switch and Residual Momentum from Strategy List
+    # Include both old and new strategies
     strategies = {
+        # NEW STRATEGIES (designed for higher hit rate)
+        '🆕 Quality Momentum': ('quality_momentum', {}, {}, None),
+        '🆕 Persistent Alpha': ('persistent_alpha', {}, {}, None),
+        '🆕 Regime Adaptive': ('regime_adaptive', {}, {}, None),
+        '🆕 Trend Confirmation': ('trend_confirmation', {}, {}, None),
+        '🆕 Best Day Capture': ('best_day_capture', {}, {}, None),
+        '🆕 Low Vol Momentum': ('low_vol_momentum', {}, {}, None),
+        '🆕 Composite Predictor': ('composite_predictor', {}, {}, None),
+        # EXISTING STRATEGIES
         'Stable Momentum': ('stable_momentum', {}, {}, None),
         'Consistent Alpha': ('consistent_alpha', {}, {}, None),
         'Martin Ratio': ('martin', {}, {}, None),
@@ -813,10 +1475,22 @@ def render_comparison_tab(nav, maps, nifty, top_n, target_n, hold):
          fig.add_trace(go.Scatter(x=ben['date'], y=ben['value'], name='Benchmark (Nifty)', line=dict(color='black', dash='dot', width=2)))
 
     if results:
-        df_res = pd.DataFrame(results).set_index('Strategy').sort_values('CAGR %', ascending=False)
+        df_res = pd.DataFrame(results).set_index('Strategy')
+        
+        # Sort by hit rate to show best hit rate strategies first
+        df_res = df_res.sort_values('Hit Rate %', ascending=False)
+        
         st.caption(f"Hit Rate Logic: How many of the Top {top_n} selected funds landed in the Top {target_n} actual performers.")
-        st.dataframe(df_res.style.format("{:.2f}").background_gradient(subset=['CAGR %'], cmap='Greens'), use_container_width=True)
+        
+        # Highlight new strategies
+        st.dataframe(
+            df_res.style.format("{:.2f}")
+            .background_gradient(subset=['Hit Rate %'], cmap='Greens')
+            .background_gradient(subset=['CAGR %'], cmap='Blues'),
+            use_container_width=True
+        )
         st.plotly_chart(fig, use_container_width=True, key="comparison_chart")
+
 
 def render_backtest_tab():
     st.header("🚀 Strategy Backtester")
@@ -824,7 +1498,7 @@ def render_backtest_tab():
     cat = c1.selectbox("Category", list(FILE_MAPPING.keys()))
     top_n = c2.number_input("Top N Funds", 1, 20, DEFAULT_TOP_N, help="Funds to Buy")
     target_n = c3.number_input("Target N Funds", 1, 20, DEFAULT_TARGET_N, help="Hit Rate Success Target")
-    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING) # Max 504 days
+    hold = c4.number_input("Holding Period (Days)", 20, 504, DEFAULT_HOLDING)
     
     with st.spinner("Loading Data..."):
         nav, maps = load_fund_data_raw(cat)
@@ -832,38 +1506,76 @@ def render_backtest_tab():
     
     if nav is None: st.error("Data not found."); return
 
-    # REMOVED TABS FOR REGIME SWITCH & RESIDUAL MOMENTUM
     tabs = st.tabs([
-        "🏆 Compare All", "⚓ Stable Mom", 
-        "🧩 Ensemble", "🧠 Consistent Alpha", "🛡️ Martin", "🚀 Momentum", "⚖️ Sharpe", "Custom"
+        "🏆 Compare All", 
+        # NEW STRATEGIES
+        "🆕 Quality Mom", "🆕 Persistent α", "🆕 Regime Adapt", 
+        "🆕 Trend Confirm", "🆕 Best Day", "🆕 Low Vol Mom", "🆕 Composite",
+        # EXISTING
+        "⚓ Stable Mom", "🧩 Ensemble", "🧠 Consistent α", "🛡️ Martin", "🚀 Momentum", "⚖️ Sharpe", "Custom"
     ])
     
     with tabs[0]:
         render_comparison_tab(nav, maps, nifty, top_n, target_n, hold)
 
+    # NEW STRATEGIES TABS
     with tabs[1]:
-        st.info("⚓ **Stable Momentum**")
-        st.markdown("**Logic:** 1. Get Top 2x funds by **Momentum**. 2. Filter that pool for **Lowest Drawdown**.")
-        display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, target_n, hold, {}, {})
-
+        display_backtest_results(nav, maps, nifty, 'quality_momentum', top_n, target_n, hold, {}, {},
+            description="🆕 **Quality Momentum**: Combines momentum with R-squared trend quality. Smooth, consistent uptrends are more likely to continue than volatile ones.")
+    
     with tabs[2]:
-        st.info("🧩 **Ensemble Strategy**")
-        display_backtest_results(nav, maps, nifty, 'ensemble', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, {'momentum':0.4, 'capture':0.6})
-
+        display_backtest_results(nav, maps, nifty, 'persistent_alpha', top_n, target_n, hold, {}, {},
+            description="🆕 **Persistent Alpha**: Tracks funds that consistently rank in top quartiles across multiple quarters. Skill persists; luck doesn't.")
+    
     with tabs[3]:
-        st.info("🧠 **Consistent Alpha**")
-        display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, target_n, hold, {}, {})
-
+        display_backtest_results(nav, maps, nifty, 'regime_adaptive', top_n, target_n, hold, {}, {},
+            description="🆕 **Regime Adaptive**: Funds that perform well in BOTH high and low volatility environments. Robust across conditions = better future performance.")
+    
     with tabs[4]:
-        display_backtest_results(nav, maps, nifty, 'martin', top_n, target_n, hold, {}, {})
-        
+        display_backtest_results(nav, maps, nifty, 'trend_confirmation', top_n, target_n, hold, {}, {},
+            description="🆕 **Trend Confirmation**: Multi-timeframe trend analysis (50/200 day MAs). Confirmed trends have higher continuation probability.")
+    
     with tabs[5]:
-        display_backtest_results(nav, maps, nifty, 'momentum', top_n, target_n, hold, {}, {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True})
-
+        display_backtest_results(nav, maps, nifty, 'best_day_capture', top_n, target_n, hold, {}, {},
+            description="🆕 **Best Day Capture**: Funds that capture the biggest up days in the market. Missing best days kills returns.")
+    
     with tabs[6]:
-        display_backtest_results(nav, maps, nifty, 'sharpe', top_n, target_n, hold, {}, {})
-
+        display_backtest_results(nav, maps, nifty, 'low_vol_momentum', top_n, target_n, hold, {}, {},
+            description="🆕 **Low Volatility Momentum**: Momentum filtered for lower volatility. Low vol + momentum = more sustainable outperformance.")
+    
     with tabs[7]:
+        display_backtest_results(nav, maps, nifty, 'composite_predictor', top_n, target_n, hold, {}, {},
+            description="🆕 **Composite Predictor**: Ensemble of best predictive signals (Quality Momentum, Rank Persistence, Regime Adaptability, Trend, Sharpe).")
+
+    # EXISTING STRATEGIES TABS
+    with tabs[8]:
+        display_backtest_results(nav, maps, nifty, 'stable_momentum', top_n, target_n, hold, {}, {},
+            description="⚓ **Stable Momentum**: Top funds by Momentum, filtered for Lowest Drawdown.")
+
+    with tabs[9]:
+        display_backtest_results(nav, maps, nifty, 'ensemble', top_n, target_n, hold, {}, 
+            {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True}, 
+            {'momentum':0.4, 'capture':0.6},
+            description="🧩 **Ensemble Strategy**: Weighted combination of Momentum (40%) and Capture Ratio (60%).")
+
+    with tabs[10]:
+        display_backtest_results(nav, maps, nifty, 'consistent_alpha', top_n, target_n, hold, {}, {},
+            description="🧠 **Consistent Alpha**: Rolling Win Rate (60%) + Information Ratio (40%).")
+
+    with tabs[11]:
+        display_backtest_results(nav, maps, nifty, 'martin', top_n, target_n, hold, {}, {},
+            description="🛡️ **Martin Ratio**: Risk-adjusted return using Ulcer Index (penalizes drawdown duration).")
+        
+    with tabs[12]:
+        display_backtest_results(nav, maps, nifty, 'momentum', top_n, target_n, hold, {}, 
+            {'w_3m':0.33, 'w_6m':0.33, 'w_12m':0.33, 'risk_adjust':True},
+            description="🚀 **Momentum**: Weighted 3/6/12 month momentum with volatility adjustment.")
+
+    with tabs[13]:
+        display_backtest_results(nav, maps, nifty, 'sharpe', top_n, target_n, hold, {}, {},
+            description="⚖️ **Sharpe Ratio**: Classic risk-adjusted return metric.")
+
+    with tabs[14]:
         st.write("Custom weights...")
         col_c1, col_c2, col_c3 = st.columns(3)
         cw_sh = col_c1.slider("Sharpe Ratio", 0.0, 1.0, 0.5, key="c_sh")
@@ -894,10 +1606,28 @@ def render_backtest_tab():
         else:
             st.warning("Please select at least one weight > 0")
 
+
 def main():
+    st.title("📈 Advanced Fund Analysis with High-Hit-Rate Strategies")
+    
+    st.markdown("""
+    ### New Strategies Added for Higher Hit Rate:
+    
+    | Strategy | Key Insight | Why Higher Hit Rate? |
+    |----------|-------------|---------------------|
+    | **Quality Momentum** | R² of price trend | Smooth trends continue more reliably |
+    | **Persistent Alpha** | Quarterly rank consistency | Skill persists; luck doesn't |
+    | **Regime Adaptive** | Performance in both high/low vol | Robust funds are more predictable |
+    | **Trend Confirmation** | Multi-timeframe trend alignment | Confirmed trends = higher continuation |
+    | **Best Day Capture** | Performance on market's best days | Good stock pickers capture upside |
+    | **Low Vol Momentum** | Momentum + low volatility | Sustainable outperformance |
+    | **Composite Predictor** | Ensemble of predictive signals | Multiple signals = more robust |
+    """)
+    
     t1, t2 = st.tabs(["📂 Category Explorer", "🚀 Strategy Backtester"])
     with t1: render_explorer_tab()
     with t2: render_backtest_tab()
+
 
 if __name__ == "__main__":
     main()
