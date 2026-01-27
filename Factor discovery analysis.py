@@ -7,6 +7,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 from scipy import stats
+import pickle
+import json
 
 warnings.filterwarnings('ignore')
 
@@ -26,7 +28,11 @@ RISK_FREE_RATE = 0.06
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
 DATA_DIR = "data"
+RESULTS_DIR = "factor_discovery_results"
 MAX_DATA_DATE = pd.Timestamp('2025-12-05')
+
+# Create results directory if not exists
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # --- File Mapping ---
 FILE_MAPPING = {
@@ -37,6 +43,18 @@ FILE_MAPPING = {
     "Multi Cap": "MULTICAP.xlsx",
     "International": "international_merged.xlsx"
 }
+
+# --- Results File Paths ---
+def get_results_paths():
+    return {
+        'factor_importance': os.path.join(RESULTS_DIR, 'factor_importance_all.csv'),
+        'factor_comparison': os.path.join(RESULTS_DIR, 'factor_comparison_all.csv'),
+        'run_metadata': os.path.join(RESULTS_DIR, 'run_metadata.json'),
+        'category_summary': os.path.join(RESULTS_DIR, 'category_summary.csv'),
+        'top_factors_by_category': os.path.join(RESULTS_DIR, 'top_factors_by_category.csv'),
+        'backtest_results': os.path.join(RESULTS_DIR, 'backtest_results.csv'),
+        'period_data': os.path.join(RESULTS_DIR, 'period_data.pkl')
+    }
 
 # ============================================================================
 # 2. DATA LOADING
@@ -98,14 +116,114 @@ def load_nifty_data():
 
 
 # ============================================================================
-# 3. ALL FACTOR CALCULATIONS
+# 3. RESULTS LOADING & SAVING
+# ============================================================================
+
+def load_cached_results():
+    """Load previously saved results if they exist."""
+    paths = get_results_paths()
+    results = {
+        'exists': False,
+        'metadata': None,
+        'factor_importance': None,
+        'factor_comparison': None,
+        'category_summary': None,
+        'top_factors_by_category': None,
+        'backtest_results': None,
+        'period_data': None
+    }
+    
+    # Check if metadata exists
+    if not os.path.exists(paths['run_metadata']):
+        return results
+    
+    try:
+        # Load metadata
+        with open(paths['run_metadata'], 'r') as f:
+            results['metadata'] = json.load(f)
+        
+        # Load CSVs
+        if os.path.exists(paths['factor_importance']):
+            results['factor_importance'] = pd.read_csv(paths['factor_importance'], index_col=[0, 1])
+        
+        if os.path.exists(paths['factor_comparison']):
+            results['factor_comparison'] = pd.read_csv(paths['factor_comparison'])
+        
+        if os.path.exists(paths['category_summary']):
+            results['category_summary'] = pd.read_csv(paths['category_summary'], index_col=0)
+        
+        if os.path.exists(paths['top_factors_by_category']):
+            results['top_factors_by_category'] = pd.read_csv(paths['top_factors_by_category'], index_col=0)
+        
+        if os.path.exists(paths['backtest_results']):
+            results['backtest_results'] = pd.read_csv(paths['backtest_results'], index_col=0)
+        
+        # Load pickle data
+        if os.path.exists(paths['period_data']):
+            with open(paths['period_data'], 'rb') as f:
+                results['period_data'] = pickle.load(f)
+        
+        results['exists'] = True
+        
+    except Exception as e:
+        st.warning(f"Error loading cached results: {e}")
+        results['exists'] = False
+    
+    return results
+
+
+def save_results(factor_importance_all, factor_comparison_all, category_summary, 
+                 top_factors_by_category, backtest_results, period_data_all, 
+                 holding_period, top_n):
+    """Save all results to disk."""
+    paths = get_results_paths()
+    
+    try:
+        # Save metadata
+        metadata = {
+            'last_run': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'holding_period': holding_period,
+            'top_n': top_n,
+            'categories_analyzed': list(FILE_MAPPING.keys()),
+            'num_factors': len(factor_importance_all.index.get_level_values('factor').unique()) if factor_importance_all is not None else 0
+        }
+        with open(paths['run_metadata'], 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Save DataFrames
+        if factor_importance_all is not None:
+            factor_importance_all.to_csv(paths['factor_importance'])
+        
+        if factor_comparison_all is not None:
+            factor_comparison_all.to_csv(paths['factor_comparison'], index=False)
+        
+        if category_summary is not None:
+            category_summary.to_csv(paths['category_summary'])
+        
+        if top_factors_by_category is not None:
+            top_factors_by_category.to_csv(paths['top_factors_by_category'])
+        
+        if backtest_results is not None:
+            backtest_results.to_csv(paths['backtest_results'])
+        
+        # Save period data (pickle for complex objects)
+        if period_data_all is not None:
+            with open(paths['period_data'], 'wb') as f:
+                pickle.dump(period_data_all, f)
+        
+        return True
+    
+    except Exception as e:
+        st.error(f"Error saving results: {e}")
+        return False
+
+
+# ============================================================================
+# 4. ALL FACTOR CALCULATIONS
 # ============================================================================
 
 def calculate_all_factors(series, bench_series=None, nav_df=None):
-    """
-    Calculate ALL possible factors for a fund at a given point in time.
-    Returns a dictionary of factor_name: value
-    """
+    """Calculate ALL possible factors for a fund at a given point in time."""
     factors = {}
     
     if len(series) < 126:
@@ -113,7 +231,6 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     
     returns = series.pct_change().dropna()
     
-    # Get benchmark returns if available
     bench_rets = None
     if bench_series is not None:
         common_idx = returns.index.intersection(bench_series.index)
@@ -125,7 +242,6 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # RETURN-BASED FACTORS
     # ==========================================
     
-    # 1. Momentum (various windows)
     if len(series) >= 63:
         factors['momentum_3m'] = (series.iloc[-1] / series.iloc[-63]) - 1 if series.iloc[-63] > 0 else np.nan
     
@@ -134,28 +250,22 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     
     if len(series) >= 252:
         factors['momentum_12m'] = (series.iloc[-1] / series.iloc[-252]) - 1 if series.iloc[-252] > 0 else np.nan
-    
-    # 2. Momentum excluding recent month (avoids short-term reversal)
-    if len(series) >= 252:
         factors['momentum_12m_ex_1m'] = (series.iloc[-21] / series.iloc[-252]) - 1 if series.iloc[-252] > 0 else np.nan
     
     # ==========================================
     # RISK-ADJUSTED FACTORS
     # ==========================================
     
-    # 3. Sharpe Ratio
     if len(returns) >= 126 and returns.std() > 0:
         excess_ret = returns - DAILY_RISK_FREE_RATE
         factors['sharpe'] = (excess_ret.mean() / returns.std()) * np.sqrt(TRADING_DAYS_YEAR)
     
-    # 4. Sortino Ratio
     if len(returns) >= 126:
         downside = returns[returns < 0]
         if len(downside) > 10 and downside.std() > 0:
             excess_ret = (returns - DAILY_RISK_FREE_RATE).mean()
             factors['sortino'] = (excess_ret / downside.std()) * np.sqrt(TRADING_DAYS_YEAR)
     
-    # 5. Calmar Ratio
     if len(series) >= 252:
         max_dd = calculate_max_dd(series)
         if max_dd is not None and max_dd < 0:
@@ -167,17 +277,14 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # VOLATILITY FACTORS
     # ==========================================
     
-    # 6. Volatility (annualized)
     if len(returns) >= 63:
         factors['volatility'] = returns.std() * np.sqrt(TRADING_DAYS_YEAR)
     
-    # 7. Downside Volatility
     if len(returns) >= 63:
         downside = returns[returns < 0]
         if len(downside) > 10:
             factors['downside_vol'] = downside.std() * np.sqrt(TRADING_DAYS_YEAR)
     
-    # 8. Volatility of Volatility (stability of risk)
     if len(returns) >= 126:
         rolling_vol = returns.rolling(21).std()
         factors['vol_of_vol'] = rolling_vol.std() if rolling_vol.std() > 0 else np.nan
@@ -186,24 +293,17 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # DRAWDOWN FACTORS
     # ==========================================
     
-    # 9. Max Drawdown
     max_dd = calculate_max_dd(series)
     if max_dd is not None:
         factors['max_drawdown'] = max_dd
     
-    # 10. Average Drawdown
     if len(series) >= 126:
         cum_max = series.expanding(min_periods=1).max()
         drawdowns = (series / cum_max) - 1
         factors['avg_drawdown'] = drawdowns.mean()
-    
-    # 11. Drawdown Duration (avg days in drawdown)
-    if len(series) >= 126:
-        cum_max = series.expanding(min_periods=1).max()
         in_drawdown = series < cum_max
         factors['drawdown_duration_pct'] = in_drawdown.sum() / len(series)
     
-    # 12. Recovery Speed (inverse of avg recovery time)
     recovery_speed = calculate_recovery_speed(series)
     if recovery_speed is not None:
         factors['recovery_speed'] = recovery_speed
@@ -217,43 +317,35 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
         f_ret = returns.loc[common_idx]
         b_ret = bench_rets.loc[common_idx]
         
-        # 13. Beta
         if len(common_idx) > 30:
             cov_matrix = np.cov(f_ret, b_ret)
             if cov_matrix[1, 1] > 0:
                 factors['beta'] = cov_matrix[0, 1] / cov_matrix[1, 1]
         
-        # 14. Alpha (Jensen's)
         if 'beta' in factors:
             mean_fund = f_ret.mean() * TRADING_DAYS_YEAR
             mean_bench = b_ret.mean() * TRADING_DAYS_YEAR
             factors['alpha'] = mean_fund - (RISK_FREE_RATE + factors['beta'] * (mean_bench - RISK_FREE_RATE))
         
-        # 15. Information Ratio
         active_ret = f_ret - b_ret
         tracking_error = active_ret.std() * np.sqrt(TRADING_DAYS_YEAR)
         if tracking_error > 0:
             factors['information_ratio'] = (active_ret.mean() * TRADING_DAYS_YEAR) / tracking_error
         
-        # 16. Up Capture
         up_market = b_ret[b_ret > 0]
         if len(up_market) > 10 and up_market.mean() != 0:
             factors['up_capture'] = f_ret.loc[up_market.index].mean() / up_market.mean()
         
-        # 17. Down Capture
         down_market = b_ret[b_ret < 0]
         if len(down_market) > 10 and down_market.mean() != 0:
             factors['down_capture'] = f_ret.loc[down_market.index].mean() / down_market.mean()
         
-        # 18. Capture Ratio
         if 'up_capture' in factors and 'down_capture' in factors:
             if factors['down_capture'] > 0:
                 factors['capture_ratio'] = factors['up_capture'] / factors['down_capture']
         
-        # 19. Batting Average (% of periods beating benchmark)
         factors['batting_avg'] = (f_ret > b_ret).sum() / len(common_idx)
         
-        # 20. Win Rate on Down Days
         if len(down_market) > 10:
             fund_on_down = f_ret.loc[down_market.index]
             factors['win_rate_down_days'] = (fund_on_down > down_market).sum() / len(down_market)
@@ -262,20 +354,17 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # CONSISTENCY FACTORS
     # ==========================================
     
-    # 21. Return Consistency (% of positive months)
     if len(returns) >= 126:
-        monthly_rets = series.resample('M').last().pct_change().dropna()
+        monthly_rets = series.resample('ME').last().pct_change().dropna()
         if len(monthly_rets) > 3:
             factors['pct_positive_months'] = (monthly_rets > 0).sum() / len(monthly_rets)
     
-    # 22. Rolling Sharpe Consistency
     if len(returns) >= 252:
         rolling_sharpe = returns.rolling(63).apply(
             lambda x: (x.mean() - DAILY_RISK_FREE_RATE) / x.std() * np.sqrt(TRADING_DAYS_YEAR) if x.std() > 0 else 0
         )
         factors['sharpe_consistency'] = 1 - (rolling_sharpe.std() / abs(rolling_sharpe.mean())) if rolling_sharpe.mean() != 0 else 0
     
-    # 23. Rank Persistence (if nav_df provided)
     if nav_df is not None and len(series) >= 252:
         rank_persist = calculate_rank_persistence(series, nav_df)
         if rank_persist is not None:
@@ -285,18 +374,16 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # TREND QUALITY FACTORS
     # ==========================================
     
-    # 24. Trend R-squared (quality of trend)
     if len(series) >= 126:
         y = np.log(series.iloc[-126:].values)
         x = np.arange(len(y))
         try:
             slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
             factors['trend_r_squared'] = r_value ** 2
-            factors['trend_slope'] = slope * TRADING_DAYS_YEAR  # Annualized
+            factors['trend_slope'] = slope * TRADING_DAYS_YEAR
         except:
             pass
     
-    # 25. Price vs Moving Averages
     if len(series) >= 200:
         ma_50 = series.rolling(50).mean().iloc[-1]
         ma_200 = series.rolling(200).mean().iloc[-1]
@@ -310,20 +397,10 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # HIGHER MOMENT FACTORS
     # ==========================================
     
-    # 26. Skewness (positive = more upside surprises)
     if len(returns) >= 126:
         factors['skewness'] = returns.skew()
-    
-    # 27. Kurtosis (lower = fewer extreme events)
-    if len(returns) >= 126:
         factors['kurtosis'] = returns.kurtosis()
-    
-    # 28. VaR 95% (Value at Risk)
-    if len(returns) >= 126:
         factors['var_95'] = returns.quantile(0.05)
-    
-    # 29. CVaR / Expected Shortfall
-    if len(returns) >= 126:
         var_threshold = returns.quantile(0.05)
         factors['cvar_95'] = returns[returns <= var_threshold].mean()
     
@@ -331,7 +408,6 @@ def calculate_all_factors(series, bench_series=None, nav_df=None):
     # REGIME FACTORS
     # ==========================================
     
-    # 30. Performance in High Vol vs Low Vol periods
     if len(returns) >= 252 and bench_rets is not None:
         bench_vol = bench_rets.rolling(21).std()
         median_vol = bench_vol.median()
@@ -449,72 +525,58 @@ def calculate_rank_persistence(series, nav_df, lookback_quarters=4):
 
 
 # ============================================================================
-# 4. FACTOR DISCOVERY ENGINE
+# 5. FACTOR DISCOVERY ENGINE (FOR SINGLE CATEGORY)
 # ============================================================================
 
-def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, scheme_map=None):
-    """
-    Main function: Discovers which factors predicted top performers.
+def run_factor_discovery_single(nav_df, benchmark_series, holding_period=252, top_n=5, 
+                                 category_name="Unknown", scheme_map=None, progress_callback=None):
+    """Run factor discovery for a single category."""
     
-    Returns:
-    - factor_importance: DataFrame showing how predictive each factor was
-    - period_analysis: Detailed analysis for each period
-    - winner_profiles: What top funds looked like
-    """
-    
-    # Need at least 1 year of lookback + holding period
     min_history = 370 + holding_period
     start_date = nav_df.index.min() + pd.Timedelta(days=min_history)
     
     if start_date >= nav_df.index.max():
         return None, None, None
     
-    # Get rebalancing dates (quarterly for analysis)
-    rebal_dates = pd.date_range(start=start_date, end=nav_df.index.max() - pd.Timedelta(days=holding_period), freq='Q')
+    rebal_dates = pd.date_range(
+        start=start_date, 
+        end=nav_df.index.max() - pd.Timedelta(days=holding_period), 
+        freq='Q'
+    )
     
-    all_period_data = []
     factor_winner_comparison = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    period_data = []
     
     for idx, analysis_date in enumerate(rebal_dates):
-        status_text.text(f"Analyzing period {idx+1}/{len(rebal_dates)}: {analysis_date.strftime('%Y-%m-%d')}")
-        progress_bar.progress((idx + 1) / len(rebal_dates))
+        if progress_callback:
+            progress_callback(idx, len(rebal_dates), analysis_date)
         
-        # Get analysis date index
         try:
             analysis_idx = nav_df.index.get_loc(nav_df.index.asof(analysis_date))
         except:
             continue
         
-        # Get forward return period
         entry_idx = analysis_idx + 1
         exit_idx = entry_idx + holding_period
         
         if exit_idx >= len(nav_df):
             continue
         
-        # Calculate ACTUAL forward returns for all funds
         forward_returns = (nav_df.iloc[exit_idx] / nav_df.iloc[entry_idx]) - 1
         forward_returns = forward_returns.dropna()
         
         if len(forward_returns) < 10:
             continue
         
-        # Identify actual top N and bottom N
         actual_top_n = forward_returns.nlargest(top_n).index.tolist()
         actual_bottom_n = forward_returns.nsmallest(top_n).index.tolist()
         
-        # Get historical data for factor calculation (before analysis_date)
         hist_data = nav_df.loc[:nav_df.index[analysis_idx]]
         
-        # Get benchmark data
         bench_series_hist = None
         if benchmark_series is not None:
             bench_series_hist = benchmark_series.loc[:nav_df.index[analysis_idx]]
         
-        # Calculate ALL factors for ALL funds at analysis_date
         fund_factors = {}
         for col in nav_df.columns:
             series = hist_data[col].dropna()
@@ -528,17 +590,14 @@ def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, 
         if len(fund_factors) < 10:
             continue
         
-        # Convert to DataFrame
         factors_df = pd.DataFrame(fund_factors).T
         
-        # For each factor, compare winners vs losers vs all
         for factor in factors_df.columns:
             factor_values = factors_df[factor].dropna()
             
             if len(factor_values) < 10:
                 continue
             
-            # Get factor values for winners and losers
             winner_values = factor_values.loc[factor_values.index.intersection(actual_top_n)]
             loser_values = factor_values.loc[factor_values.index.intersection(actual_bottom_n)]
             all_values = factor_values
@@ -546,19 +605,16 @@ def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, 
             if len(winner_values) < 2 or len(loser_values) < 2:
                 continue
             
-            # Statistical comparison
             winner_mean = winner_values.mean()
             loser_mean = loser_values.mean()
             all_mean = all_values.mean()
             all_std = all_values.std()
             
-            # Normalized difference (effect size)
             if all_std > 0:
                 effect_size = (winner_mean - all_mean) / all_std
             else:
                 effect_size = 0
             
-            # T-test: are winners significantly different from rest?
             rest_values = factor_values.loc[~factor_values.index.isin(actual_top_n)]
             if len(rest_values) > 5:
                 try:
@@ -568,11 +624,11 @@ def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, 
             else:
                 t_stat, p_value = np.nan, np.nan
             
-            # Were winners in top quartile for this factor?
             top_quartile_threshold = factor_values.quantile(0.75)
             winners_in_top_quartile = (winner_values >= top_quartile_threshold).sum() / len(winner_values)
             
             factor_winner_comparison.append({
+                'category': category_name,
                 'period': analysis_date,
                 'factor': factor,
                 'winner_mean': winner_mean,
@@ -585,37 +641,31 @@ def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, 
                 'winners_in_top_quartile': winners_in_top_quartile
             })
         
-        # Store period data
-        all_period_data.append({
+        period_data.append({
+            'category': category_name,
             'period': analysis_date,
             'holding_period': holding_period,
             'top_n_funds': actual_top_n,
-            'top_n_returns': forward_returns.loc[actual_top_n].tolist(),
-            'factors_df': factors_df,
-            'forward_returns': forward_returns
+            'top_n_fund_names': [scheme_map.get(f, f) for f in actual_top_n] if scheme_map else actual_top_n,
+            'top_n_returns': forward_returns.loc[actual_top_n].tolist()
         })
-    
-    progress_bar.empty()
-    status_text.empty()
     
     if not factor_winner_comparison:
         return None, None, None
     
-    # Aggregate factor importance across all periods
     comparison_df = pd.DataFrame(factor_winner_comparison)
     
     factor_importance = comparison_df.groupby('factor').agg({
         'effect_size': ['mean', 'std'],
-        'winners_higher': 'mean',  # % of time winners had higher value
-        'winners_in_top_quartile': 'mean',  # Avg % of winners in top quartile
-        'p_value': lambda x: (x < 0.05).mean(),  # % of time statistically significant
+        'winners_higher': 'mean',
+        'winners_in_top_quartile': 'mean',
+        'p_value': lambda x: (x < 0.05).mean(),
         'period': 'count'
     }).round(3)
     
     factor_importance.columns = ['Avg_Effect_Size', 'Effect_Size_Std', 'Pct_Winners_Higher', 
                                   'Avg_Winners_TopQuartile', 'Pct_Significant', 'Num_Periods']
     
-    # Sort by predictive power
     factor_importance['Predictive_Score'] = (
         factor_importance['Pct_Winners_Higher'] * 0.3 +
         factor_importance['Avg_Winners_TopQuartile'] * 0.3 +
@@ -624,36 +674,160 @@ def run_factor_discovery(nav_df, benchmark_series, holding_period=252, top_n=5, 
     )
     
     factor_importance = factor_importance.sort_values('Predictive_Score', ascending=False)
+    factor_importance['category'] = category_name
     
-    return factor_importance, comparison_df, all_period_data
+    return factor_importance, comparison_df, period_data
 
 
 # ============================================================================
-# 5. DATA-DRIVEN STRATEGY
+# 6. RUN ALL CATEGORIES
+# ============================================================================
+
+def run_factor_discovery_all_categories(holding_period=252, top_n=5):
+    """Run factor discovery for ALL categories and aggregate results."""
+    
+    all_factor_importance = []
+    all_factor_comparison = []
+    all_period_data = []
+    category_summaries = []
+    backtest_results = []
+    
+    benchmark = load_nifty_data()
+    
+    total_categories = len(FILE_MAPPING)
+    
+    # Create progress containers
+    overall_progress = st.progress(0)
+    category_status = st.empty()
+    period_status = st.empty()
+    
+    for cat_idx, (category, filename) in enumerate(FILE_MAPPING.items()):
+        category_status.markdown(f"### Processing: **{category}** ({cat_idx + 1}/{total_categories})")
+        
+        nav_df, scheme_map = load_fund_data_raw(category)
+        
+        if nav_df is None:
+            st.warning(f"Could not load data for {category}")
+            continue
+        
+        def progress_callback(period_idx, total_periods, current_date):
+            period_status.text(f"  Period {period_idx + 1}/{total_periods}: {current_date.strftime('%Y-%m-%d')}")
+        
+        factor_importance, comparison_df, period_data = run_factor_discovery_single(
+            nav_df, benchmark, holding_period, top_n, category, scheme_map, progress_callback
+        )
+        
+        if factor_importance is not None:
+            all_factor_importance.append(factor_importance)
+            all_factor_comparison.append(comparison_df)
+            all_period_data.extend(period_data)
+            
+            # Category summary
+            top_3_factors = factor_importance.head(3).index.tolist()
+            category_summaries.append({
+                'category': category,
+                'num_funds': len(nav_df.columns),
+                'num_periods_analyzed': len(comparison_df['period'].unique()),
+                'top_factor_1': top_3_factors[0] if len(top_3_factors) > 0 else None,
+                'top_factor_2': top_3_factors[1] if len(top_3_factors) > 1 else None,
+                'top_factor_3': top_3_factors[2] if len(top_3_factors) > 2 else None,
+                'best_predictive_score': factor_importance['Predictive_Score'].max()
+            })
+            
+            # Run data-driven backtest for this category
+            hist, eq, bench = run_data_driven_backtest(
+                nav_df, benchmark, factor_importance, holding_period, min(top_n, 3), scheme_map
+            )
+            
+            if hist is not None and not eq.empty:
+                start_date = eq.iloc[0]['date']
+                end_date = eq.iloc[-1]['date']
+                years = (end_date - start_date).days / 365.25
+                
+                strat_cagr = (eq.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                bench_cagr = (bench.iloc[-1]['value']/100)**(1/years)-1 if years > 0 and not bench.empty else 0
+                avg_hit_rate = hist['hit_rate'].mean()
+                
+                backtest_results.append({
+                    'category': category,
+                    'strategy_cagr': strat_cagr,
+                    'benchmark_cagr': bench_cagr,
+                    'outperformance': strat_cagr - bench_cagr,
+                    'avg_hit_rate': avg_hit_rate,
+                    'num_trades': len(hist)
+                })
+        
+        overall_progress.progress((cat_idx + 1) / total_categories)
+    
+    overall_progress.empty()
+    category_status.empty()
+    period_status.empty()
+    
+    if not all_factor_importance:
+        return None, None, None, None, None, None
+    
+    # Combine all results
+    combined_factor_importance = pd.concat(all_factor_importance)
+    combined_factor_importance = combined_factor_importance.reset_index()
+    combined_factor_importance = combined_factor_importance.set_index(['category', 'factor'])
+    
+    combined_comparison = pd.concat(all_factor_comparison, ignore_index=True)
+    
+    category_summary_df = pd.DataFrame(category_summaries).set_index('category')
+    
+    # Create top factors by category table
+    top_factors_by_cat = []
+    for cat_fi in all_factor_importance:
+        cat_name = cat_fi['category'].iloc[0]
+        for rank, (factor, row) in enumerate(cat_fi.head(10).iterrows(), 1):
+            top_factors_by_cat.append({
+                'category': cat_name,
+                'rank': rank,
+                'factor': factor,
+                'predictive_score': row['Predictive_Score'],
+                'pct_winners_higher': row['Pct_Winners_Higher']
+            })
+    
+    top_factors_df = pd.DataFrame(top_factors_by_cat)
+    top_factors_pivot = top_factors_df.pivot(index='factor', columns='category', values='rank')
+    top_factors_pivot['avg_rank'] = top_factors_pivot.mean(axis=1)
+    top_factors_pivot = top_factors_pivot.sort_values('avg_rank')
+    
+    backtest_df = pd.DataFrame(backtest_results).set_index('category') if backtest_results else None
+    
+    return (combined_factor_importance, combined_comparison, category_summary_df, 
+            top_factors_pivot, backtest_df, all_period_data)
+
+
+# ============================================================================
+# 7. DATA-DRIVEN BACKTEST
 # ============================================================================
 
 def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holding_period=252, top_n=3, scheme_map=None):
-    """
-    Uses discovered factor weights to pick funds.
-    """
+    """Uses discovered factor weights to pick funds."""
     
-    # Get top factors
-    top_factors = factor_importance.head(10).index.tolist()
+    if factor_importance is None or factor_importance.empty:
+        return None, None, None
     
-    # Get factor weights based on importance
-    weights = factor_importance.loc[top_factors, 'Predictive_Score'].to_dict()
+    # Handle multi-index (category, factor) - get just factor level
+    if isinstance(factor_importance.index, pd.MultiIndex):
+        fi = factor_importance.reset_index(level=0, drop=True)
+    else:
+        fi = factor_importance
+    
+    top_factors = fi.head(10).index.tolist()
+    
+    weights = fi.loc[top_factors, 'Predictive_Score'].to_dict()
     total_weight = sum(weights.values())
+    if total_weight == 0:
+        return None, None, None
     weights = {k: v/total_weight for k, v in weights.items()}
     
-    # Check which factors favor HIGHER vs LOWER values
     factor_direction = {}
     for factor in top_factors:
-        # If winners consistently had higher values, we want higher
-        # Some factors like volatility, max_drawdown - lower is better
-        pct_higher = factor_importance.loc[factor, 'Pct_Winners_Higher']
+        pct_higher = fi.loc[factor, 'Pct_Winners_Higher']
         factor_direction[factor] = 1 if pct_higher > 0.5 else -1
     
-    # Run backtest
     min_history = 370
     start_date = nav_df.index.min() + pd.Timedelta(days=min_history)
     
@@ -675,14 +849,12 @@ def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holdin
     for i in rebal_idx:
         date = nav_df.index[i]
         
-        # Get historical data
         hist_data = nav_df.loc[:date]
         
         bench_series_hist = None
         if benchmark_series is not None:
             bench_series_hist = benchmark_series.loc[:date]
         
-        # Calculate factors for all funds
         fund_scores = {}
         
         for col in nav_df.columns:
@@ -696,34 +868,27 @@ def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holdin
             if not factors:
                 continue
             
-            # Calculate weighted score using discovered factors
             score = 0
             valid_factors = 0
             
             for factor, weight in weights.items():
                 if factor in factors and not pd.isna(factors[factor]):
-                    # Normalize factor value (rank-based)
                     normalized_value = factors[factor]
-                    # Apply direction
                     score += normalized_value * weight * factor_direction.get(factor, 1)
                     valid_factors += 1
             
             if valid_factors >= 3:
                 fund_scores[col] = score
         
-        # Rank and select top N
         if not fund_scores:
             selected = []
         else:
-            # Convert to ranks for fair comparison
             score_series = pd.Series(fund_scores)
             selected = score_series.nlargest(top_n).index.tolist()
         
-        # Calculate returns
         entry = i + 1
         exit_i = min(i + 1 + holding_period, len(nav_df) - 1)
         
-        # Benchmark return
         b_ret = 0.0
         if benchmark_series is not None:
             try:
@@ -731,7 +896,6 @@ def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holdin
             except:
                 pass
         
-        # Portfolio return
         port_ret = 0.0
         hit_rate = 0.0
         
@@ -739,7 +903,6 @@ def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holdin
             period_ret_all = (nav_df.iloc[exit_i] / nav_df.iloc[entry]) - 1
             port_ret = period_ret_all[selected].mean()
             
-            # Hit rate
             actual_top = period_ret_all.dropna().nlargest(top_n).index.tolist()
             matches = len(set(selected).intersection(set(actual_top)))
             hit_rate = matches / top_n
@@ -762,95 +925,94 @@ def run_data_driven_backtest(nav_df, benchmark_series, factor_importance, holdin
 
 
 # ============================================================================
-# 6. UI COMPONENTS
+# 8. UI COMPONENTS
 # ============================================================================
 
-def render_factor_discovery_page():
-    st.title("🧬 Factor Discovery: Winner DNA Analysis")
+def display_cached_results(results):
+    """Display previously cached results."""
     
-    st.markdown("""
-    ### What This Does
+    metadata = results['metadata']
     
-    Instead of **assuming** which factors matter, this tool **discovers** what top-performing funds actually had in common.
+    st.success(f"✅ Showing results from last run: **{metadata['last_run']}**")
     
-    **Process:**
-    1. At each historical period, identify the ACTUAL top 5 funds (by forward returns)
-    2. Look at what factors these winners had BEFORE they won
-    3. Compare winners vs rest of funds
-    4. Find patterns that consistently predict winners
-    """)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Holding Period", f"{metadata['holding_period']} days")
+    col2.metric("Top N Analyzed", metadata['top_n'])
+    col3.metric("Factors Analyzed", metadata['num_factors'])
     
-    st.divider()
+    # Tabs for different views
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Cross-Category Analysis",
+        "🏆 Category Comparison", 
+        "🧬 Factor Rankings",
+        "📈 Backtest Results",
+        "🔬 Detailed Data"
+    ])
     
-    # Controls
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        category = st.selectbox("Category", list(FILE_MAPPING.keys()))
-    
-    with col2:
-        holding_period = st.selectbox("Holding Period", [126, 252, 378, 504], index=1, 
-                                       format_func=lambda x: f"{x} days (~{x//21} months)")
-    
-    with col3:
-        top_n = st.number_input("Top N to Analyze", 3, 10, 5, 
-                                help="How many top performers to study")
-    
-    with col4:
-        run_analysis = st.button("🔍 Run Factor Discovery", type="primary", use_container_width=True)
-    
-    if run_analysis:
-        with st.spinner("Loading data..."):
-            nav_df, scheme_map = load_fund_data_raw(category)
-            benchmark = load_nifty_data()
+    with tab1:
+        st.subheader("Which Factors Predict Winners Across ALL Categories?")
         
-        if nav_df is None:
-            st.error("Could not load data")
-            return
-        
-        st.info(f"Loaded {len(nav_df.columns)} funds from {category}")
-        
-        with st.spinner("Running factor discovery... This may take a minute."):
-            factor_importance, comparison_df, period_data = run_factor_discovery(
-                nav_df, benchmark, holding_period, top_n, scheme_map
-            )
-        
-        if factor_importance is None:
-            st.error("Not enough data for analysis")
-            return
-        
-        # ==========================================
-        # RESULTS
-        # ==========================================
-        
-        st.success("✅ Factor Discovery Complete!")
-        
-        # Tab layout for results
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📊 Factor Importance", 
-            "🧬 Winner DNA Profile",
-            "📈 Data-Driven Strategy",
-            "🔬 Detailed Analysis"
-        ])
-        
-        with tab1:
-            st.subheader("Which Factors Predicted Winners?")
-            
+        if results['top_factors_by_category'] is not None:
             st.markdown("""
-            **How to Read This:**
-            - **Pct_Winners_Higher**: % of time winners had higher values for this factor
-            - **Avg_Winners_TopQuartile**: How often were winners in top 25% for this factor?
-            - **Pct_Significant**: Statistical significance (p < 0.05)
-            - **Predictive_Score**: Combined score (higher = more predictive)
+            **How to read this table:**
+            - Each cell shows the RANK of that factor within each category (1 = most predictive)
+            - Lower average rank = more consistently predictive across categories
+            - Factors at top are the "universal" winner predictors
             """)
             
-            # Display top factors
-            display_df = factor_importance.head(20).copy()
-            display_df = display_df.round(3)
+            display_df = results['top_factors_by_category'].head(20).copy()
+            
+            # Style the dataframe
+            st.dataframe(
+                display_df.style.background_gradient(subset=['avg_rank'], cmap='Greens_r')
+                .format('{:.1f}', na_rep='-'),
+                use_container_width=True,
+                height=500
+            )
+            
+            # Top universal factors
+            st.subheader("🎯 Top Universal Predictors (Work Across Categories)")
+            top_universal = display_df.head(5)
+            for idx, (factor, row) in enumerate(top_universal.iterrows(), 1):
+                st.markdown(f"**{idx}. {factor}** - Avg Rank: {row['avg_rank']:.1f}")
+    
+    with tab2:
+        st.subheader("Category-by-Category Summary")
+        
+        if results['category_summary'] is not None:
+            st.dataframe(
+                results['category_summary'].style.format({
+                    'best_predictive_score': '{:.3f}'
+                }),
+                use_container_width=True
+            )
+            
+            # Visualization
+            fig = go.Figure()
+            
+            for category in results['category_summary'].index:
+                row = results['category_summary'].loc[category]
+                factors = [row['top_factor_1'], row['top_factor_2'], row['top_factor_3']]
+                factors = [f for f in factors if f is not None]
+                
+                st.markdown(f"### {category}")
+                st.markdown(f"**Top 3 Predictive Factors:** {', '.join(factors)}")
+                st.markdown("---")
+    
+    with tab3:
+        st.subheader("Factor Importance by Category")
+        
+        if results['factor_importance'] is not None:
+            # Category selector
+            categories = results['factor_importance'].index.get_level_values('category').unique().tolist()
+            selected_cat = st.selectbox("Select Category", categories)
+            
+            # Filter for selected category
+            cat_fi = results['factor_importance'].xs(selected_cat, level='category')
+            cat_fi = cat_fi.sort_values('Predictive_Score', ascending=False)
             
             st.dataframe(
-                display_df.style.background_gradient(subset=['Predictive_Score'], cmap='Greens')
-                .background_gradient(subset=['Pct_Winners_Higher'], cmap='Blues')
+                cat_fi.head(20).style.background_gradient(subset=['Predictive_Score'], cmap='Greens')
                 .format({
                     'Pct_Winners_Higher': '{:.1%}',
                     'Avg_Winners_TopQuartile': '{:.1%}',
@@ -860,178 +1022,204 @@ def render_factor_discovery_page():
                 use_container_width=True
             )
             
-            # Visualization
-            st.subheader("Factor Predictive Power")
-            
-            top_factors = factor_importance.head(15)
-            
+            # Chart
             fig = go.Figure()
+            top_15 = cat_fi.head(15)
             
             fig.add_trace(go.Bar(
                 name='% Winners Higher',
-                x=top_factors.index,
-                y=top_factors['Pct_Winners_Higher'] * 100,
+                x=top_15.index,
+                y=top_15['Pct_Winners_Higher'] * 100,
                 marker_color='steelblue'
             ))
             
             fig.add_trace(go.Bar(
                 name='% Winners in Top Quartile',
-                x=top_factors.index,
-                y=top_factors['Avg_Winners_TopQuartile'] * 100,
+                x=top_15.index,
+                y=top_15['Avg_Winners_TopQuartile'] * 100,
                 marker_color='forestgreen'
             ))
             
             fig.update_layout(
                 barmode='group',
-                title='Factor Predictive Power (Top 15 Factors)',
+                title=f'Factor Predictive Power - {selected_cat}',
                 xaxis_tickangle=-45,
                 yaxis_title='Percentage (%)',
                 height=500
             )
             
             st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.subheader("Data-Driven Strategy Backtest Results")
         
-        with tab2:
-            st.subheader("🧬 Winner DNA Profile")
+        if results['backtest_results'] is not None:
+            bt = results['backtest_results']
             
-            st.markdown("""
-            **What did winning funds look like?**
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Avg Strategy CAGR", f"{bt['strategy_cagr'].mean():.2%}")
+            col2.metric("Avg Outperformance", f"{bt['outperformance'].mean():.2%}")
+            col3.metric("Avg Hit Rate", f"{bt['avg_hit_rate'].mean():.1%}")
             
-            Based on historical analysis, here's the "fingerprint" of funds that ended up in the Top 5:
-            """)
+            # Table
+            st.dataframe(
+                bt.style.format({
+                    'strategy_cagr': '{:.2%}',
+                    'benchmark_cagr': '{:.2%}',
+                    'outperformance': '{:.2%}',
+                    'avg_hit_rate': '{:.1%}'
+                }).background_gradient(subset=['avg_hit_rate'], cmap='Greens'),
+                use_container_width=True
+            )
             
-            # Get top predictive factors
-            top_predictive = factor_importance[factor_importance['Predictive_Score'] > 0.5].head(10)
+            # Chart
+            fig = go.Figure()
             
-            if len(top_predictive) > 0:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("### ✅ Factors Where Winners Scored HIGH")
-                    high_factors = top_predictive[top_predictive['Pct_Winners_Higher'] > 0.55]
-                    for factor in high_factors.index:
-                        pct = high_factors.loc[factor, 'Pct_Winners_Higher']
-                        st.markdown(f"- **{factor}**: Winners higher {pct:.0%} of the time")
-                
-                with col2:
-                    st.markdown("### 📉 Factors Where Winners Scored LOW")
-                    low_factors = top_predictive[top_predictive['Pct_Winners_Higher'] < 0.45]
-                    for factor in low_factors.index:
-                        pct = 1 - low_factors.loc[factor, 'Pct_Winners_Higher']
-                        st.markdown(f"- **{factor}**: Winners lower {pct:.0%} of the time")
-                
-                st.divider()
-                
-                st.markdown("### 🎯 Recommended Selection Criteria")
-                st.markdown("Based on factor discovery, look for funds with:")
-                
-                criteria = []
-                for factor in top_predictive.head(5).index:
-                    pct_higher = top_predictive.loc[factor, 'Pct_Winners_Higher']
-                    quartile_pct = top_predictive.loc[factor, 'Avg_Winners_TopQuartile']
-                    
-                    if pct_higher > 0.55:
-                        criteria.append(f"✅ **High {factor}** (winners had higher {pct_higher:.0%} of time)")
-                    elif pct_higher < 0.45:
-                        criteria.append(f"✅ **Low {factor}** (winners had lower {1-pct_higher:.0%} of time)")
-                
-                for c in criteria:
-                    st.markdown(c)
+            fig.add_trace(go.Bar(
+                name='Strategy CAGR',
+                x=bt.index,
+                y=bt['strategy_cagr'] * 100,
+                marker_color='green'
+            ))
             
+            fig.add_trace(go.Bar(
+                name='Benchmark CAGR',
+                x=bt.index,
+                y=bt['benchmark_cagr'] * 100,
+                marker_color='gray'
+            ))
+            
+            fig.update_layout(
+                barmode='group',
+                title='Strategy vs Benchmark by Category',
+                yaxis_title='CAGR (%)',
+                height=400
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with tab5:
+        st.subheader("Raw Factor Comparison Data")
+        
+        if results['factor_comparison'] is not None:
+            st.markdown("Download the full factor comparison data for your own analysis:")
+            
+            csv = results['factor_comparison'].to_csv(index=False)
+            st.download_button(
+                "📥 Download Full Factor Comparison (CSV)",
+                csv,
+                "factor_comparison_all.csv",
+                "text/csv"
+            )
+            
+            st.dataframe(results['factor_comparison'].head(100), use_container_width=True)
+
+
+def render_main_page():
+    st.title("🧬 Factor Discovery: Winner DNA Analysis")
+    
+    st.markdown("""
+    ### What This Does
+    
+    Discovers **what winning funds had in common** by analyzing historical data across ALL categories.
+    
+    **Process:**
+    1. For each category and time period, identify the ACTUAL top 5 funds
+    2. Analyze what factors these winners had BEFORE they won
+    3. Find patterns that consistently predict winners
+    4. Use discovered factors for future fund selection
+    """)
+    
+    st.divider()
+    
+    # Check for cached results
+    cached_results = load_cached_results()
+    
+    # Controls
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 2])
+    
+    with col1:
+        if cached_results['exists']:
+            st.info(f"📁 Last run: {cached_results['metadata']['last_run']}")
+    
+    with col2:
+        holding_period = st.selectbox(
+            "Holding Period", 
+            [126, 252, 378, 504], 
+            index=1,
+            format_func=lambda x: f"{x} days"
+        )
+    
+    with col3:
+        top_n = st.number_input("Top N", 3, 10, 5)
+    
+    with col4:
+        run_new = st.button("🔄 Run New Discovery (All Categories)", type="primary", use_container_width=True)
+    
+    st.divider()
+    
+    # Run new discovery if requested
+    if run_new:
+        st.warning("⏳ Running factor discovery for ALL categories. This may take several minutes...")
+        
+        with st.spinner("Processing..."):
+            (factor_importance_all, factor_comparison_all, category_summary, 
+             top_factors_by_cat, backtest_results, period_data_all) = run_factor_discovery_all_categories(
+                holding_period, top_n
+            )
+        
+        if factor_importance_all is not None:
+            # Save results
+            success = save_results(
+                factor_importance_all, factor_comparison_all, category_summary,
+                top_factors_by_cat, backtest_results, period_data_all,
+                holding_period, top_n
+            )
+            
+            if success:
+                st.success("✅ Analysis complete! Results saved to disk.")
+                st.rerun()
             else:
-                st.warning("No strongly predictive factors found. Market may be highly efficient in this category.")
+                st.error("Failed to save results")
+        else:
+            st.error("Analysis failed - no data returned")
+    
+    # Display cached results if available
+    elif cached_results['exists']:
+        display_cached_results(cached_results)
+    
+    else:
+        st.info("👆 Click 'Run New Discovery' to analyze all categories and discover winning factors.")
         
-        with tab3:
-            st.subheader("📈 Data-Driven Strategy Backtest")
-            
-            st.markdown("""
-            Now let's use the discovered factors to build a strategy and test it.
-            
-            **Strategy:** Weight factors by their predictive power, then rank funds and pick top N.
-            """)
-            
-            # Show factor weights being used
-            st.markdown("**Factor Weights (based on discovery):**")
-            top_factors_used = factor_importance.head(10)
-            weights_df = top_factors_used[['Predictive_Score']].copy()
-            weights_df['Weight %'] = (weights_df['Predictive_Score'] / weights_df['Predictive_Score'].sum() * 100).round(1)
-            st.dataframe(weights_df[['Weight %']], use_container_width=True)
-            
-            # Run backtest
-            with st.spinner("Running data-driven backtest..."):
-                hist, eq, bench = run_data_driven_backtest(
-                    nav_df, benchmark, factor_importance, holding_period, min(top_n, 3), scheme_map
-                )
-            
-            if hist is not None and not eq.empty:
-                # Results
-                start_date = eq.iloc[0]['date']
-                end_date = eq.iloc[-1]['date']
-                years = (end_date - start_date).days / 365.25
-                
-                strat_fin = eq.iloc[-1]['value']
-                strat_cagr = (strat_fin/100)**(1/years)-1 if years > 0 else 0
-                
-                bench_fin = bench.iloc[-1]['value'] if not bench.empty else 100
-                bench_cagr = (bench_fin/100)**(1/years)-1 if years > 0 and not bench.empty else 0
-                
-                avg_hit_rate = hist['hit_rate'].mean()
-                
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Strategy CAGR", f"{strat_cagr:.2%}")
-                c2.metric("Benchmark CAGR", f"{bench_cagr:.2%}")
-                c3.metric("Outperformance", f"{(strat_cagr - bench_cagr):.2%}")
-                c4.metric("Avg Hit Rate", f"{avg_hit_rate:.1%}")
-                
-                # Chart
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=eq['date'], y=eq['value'], name='Data-Driven Strategy', line=dict(color='green', width=2)))
-                fig.add_trace(go.Scatter(x=bench['date'], y=bench['value'], name='Benchmark', line=dict(color='red', dash='dot')))
-                fig.update_layout(title='Data-Driven Strategy vs Benchmark', yaxis_title='Value (100 = Start)')
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Trade history
-                st.subheader("Trade History")
-                st.dataframe(hist[['date', 'selected_names', 'return', 'hit_rate']].style.format({
-                    'return': '{:.2%}',
-                    'hit_rate': '{:.0%}'
-                }), use_container_width=True)
-            
-            else:
-                st.warning("Could not run backtest")
+        st.markdown("""
+        ### What will be analyzed:
         
-        with tab4:
-            st.subheader("🔬 Detailed Period-by-Period Analysis")
-            
-            if period_data:
-                period_select = st.selectbox(
-                    "Select Period",
-                    [p['period'].strftime('%Y-%m-%d') for p in period_data],
-                    key="period_select"
-                )
-                
-                selected_period = next(p for p in period_data if p['period'].strftime('%Y-%m-%d') == period_select)
-                
-                st.markdown(f"**Period:** {period_select}")
-                st.markdown(f"**Holding Period:** {selected_period['holding_period']} days")
-                
-                # Show top funds and their returns
-                st.markdown("**Actual Top 5 Winners:**")
-                for idx, (fund_id, ret) in enumerate(zip(selected_period['top_n_funds'], selected_period['top_n_returns'])):
-                    fund_name = scheme_map.get(fund_id, fund_id)
-                    st.markdown(f"{idx+1}. **{fund_name}**: {ret:.2%} return")
-                
-                # Show their factors
-                st.markdown("**Factor Values for Winners:**")
-                factors_df = selected_period['factors_df']
-                winner_factors = factors_df.loc[factors_df.index.intersection(selected_period['top_n_funds'])]
-                winner_factors.index = winner_factors.index.map(lambda x: scheme_map.get(x, x))
-                
-                st.dataframe(winner_factors.T.style.format("{:.3f}"), use_container_width=True, height=400)
+        | Category | Description |
+        |----------|-------------|
+        | Large Cap | Large cap mutual funds |
+        | Mid Cap | Mid cap mutual funds |
+        | Small Cap | Small cap mutual funds |
+        | Large & Mid Cap | Combined large/mid cap funds |
+        | Multi Cap | Multi cap mutual funds |
+        | International | International/global funds |
+        
+        ### Factors that will be tested:
+        
+        - **Momentum**: 3m, 6m, 12m returns
+        - **Risk-Adjusted**: Sharpe, Sortino, Calmar ratios
+        - **Volatility**: Total, downside, vol-of-vol
+        - **Drawdown**: Max DD, avg DD, recovery speed
+        - **Benchmark-Relative**: Alpha, Beta, Information Ratio, Capture ratios
+        - **Consistency**: Rank persistence, % positive months
+        - **Trend**: R-squared, slope, MA relationships
+        - **Higher Moments**: Skewness, kurtosis, VaR, CVaR
+        - **Regime**: Performance in high/low volatility environments
+        """)
 
 
 def main():
-    render_factor_discovery_page()
+    render_main_page()
 
 
 if __name__ == "__main__":
