@@ -1444,6 +1444,9 @@ def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, cus
 def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_name, mom_config, top_n, target_n, holding):
     """Display comprehensive results for a strategy including detailed trade history."""
     
+    # Create a unique key prefix for this strategy to avoid duplicate element IDs
+    key_prefix = f"{strat_key}_{holding}_{top_n}_{target_n}"
+    
     with st.spinner(f"Running {strat_name} backtest..."):
         history, eq_curve, bench_curve, detailed_trades = run_backtest_detailed(
             nav_df, strat_key, top_n, target_n, holding, {}, mom_config, benchmark, scheme_map
