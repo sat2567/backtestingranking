@@ -6,7 +6,7 @@ Features:
 - Comprehensive Category Explorer with 1Y and 3Y rolling analysis
 - Beautiful modern UI with better styling
 - Dynamic columns based on number of funds selected
-- Improved visualizations
+- Complete strategy explanations and metric definitions
 
 Run: streamlit run backtest_strategy.py
 """
@@ -58,17 +58,27 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     
-    /* Custom styling for fund names */
-    .fund-hit { color: #2e7d32; font-weight: 600; }
-    .fund-miss { color: #c62828; }
+    .metric-explanation {
+        background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%);
+        border-radius: 10px; padding: 15px; margin: 10px 0;
+        border-left: 4px solid #4CAF50;
+    }
+    .strategy-card {
+        background: white; border-radius: 12px; padding: 20px; margin: 10px 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 5px solid #2196F3;
+    }
+    .formula-box {
+        background: #263238; color: #80cbc4; padding: 10px 15px;
+        border-radius: 8px; font-family: monospace; margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# 2. CONSTANTS
+# 2. CONSTANTS & DEFINITIONS
 # ============================================================================
 
-RISK_FREE_RATE = 0.06
+RISK_FREE_RATE = 0.06  # 6% annual risk-free rate (typical for Indian markets)
 TRADING_DAYS_YEAR = 252
 DAILY_RISK_FREE_RATE = (1 + RISK_FREE_RATE) ** (1/TRADING_DAYS_YEAR) - 1
 DATA_DIR = "data"
@@ -89,6 +99,294 @@ COLORS = {
 }
 
 # ============================================================================
+# METRIC DEFINITIONS - For display in dashboard
+# ============================================================================
+
+METRIC_DEFINITIONS = {
+    'CAGR': {
+        'name': 'Compound Annual Growth Rate (CAGR)',
+        'formula': 'CAGR = (Ending Value / Beginning Value)^(1/Years) - 1',
+        'description': 'The mean annual growth rate over a specified period longer than one year. It represents the rate at which an investment would have grown if it had grown at a steady rate.',
+        'interpretation': 'Higher is better. A CAGR of 15% means the investment grew at an average of 15% per year.'
+    },
+    'Sharpe Ratio': {
+        'name': 'Sharpe Ratio',
+        'formula': 'Sharpe = (Return - Risk Free Rate) / Standard Deviation',
+        'description': 'Measures risk-adjusted return. It tells you how much excess return you receive for the extra volatility you endure.',
+        'interpretation': '> 1.0 is good, > 2.0 is very good, > 3.0 is excellent. Negative means underperforming risk-free rate.'
+    },
+    'Sortino Ratio': {
+        'name': 'Sortino Ratio',
+        'formula': 'Sortino = (Return - Risk Free Rate) / Downside Deviation',
+        'description': 'Similar to Sharpe but only penalizes downside volatility. Uses only negative returns for risk calculation.',
+        'interpretation': 'Higher is better. More appropriate than Sharpe when returns are not normally distributed.'
+    },
+    'Max Drawdown': {
+        'name': 'Maximum Drawdown',
+        'formula': 'Max DD = (Trough Value - Peak Value) / Peak Value',
+        'description': 'The maximum observed loss from a peak to a trough before a new peak is attained.',
+        'interpretation': 'Lower (less negative) is better. A -20% max DD means the fund lost 20% from its peak at worst.'
+    },
+    'Calmar Ratio': {
+        'name': 'Calmar Ratio',
+        'formula': 'Calmar = CAGR / |Max Drawdown|',
+        'description': 'Measures return relative to maximum drawdown risk. Named after California Managed Accounts Reports.',
+        'interpretation': '> 1.0 is good (return exceeds max drawdown). Higher means better risk-adjusted returns.'
+    },
+    'Volatility': {
+        'name': 'Volatility (Standard Deviation)',
+        'formula': 'Volatility = StdDev(Daily Returns) × √252',
+        'description': 'Annualized standard deviation of returns. Measures total variability of returns.',
+        'interpretation': 'Lower is generally better for conservative investors. 15-20% is typical for equity funds.'
+    },
+    'Beta': {
+        'name': 'Beta',
+        'formula': 'Beta = Covariance(Fund, Benchmark) / Variance(Benchmark)',
+        'description': 'Measures sensitivity to market movements. A beta of 1.0 means the fund moves with the market.',
+        'interpretation': '< 1.0 = less volatile than market, > 1.0 = more volatile. Negative beta moves opposite to market.'
+    },
+    'Alpha': {
+        'name': 'Alpha (Jensen\'s Alpha)',
+        'formula': 'Alpha = Fund Return - [Risk Free + Beta × (Market Return - Risk Free)]',
+        'description': 'Excess return over what CAPM predicts. Measures manager skill in generating returns.',
+        'interpretation': 'Positive alpha = outperformance, Negative = underperformance. 2% alpha is excellent.'
+    },
+    'Information Ratio': {
+        'name': 'Information Ratio',
+        'formula': 'IR = (Fund Return - Benchmark Return) / Tracking Error',
+        'description': 'Measures consistency of outperformance. Tracking error is the std dev of return differences.',
+        'interpretation': '> 0.5 is good, > 1.0 is excellent. Shows skill in generating consistent excess returns.'
+    },
+    'Up Capture': {
+        'name': 'Up Capture Ratio',
+        'formula': 'Up Capture = Fund Return in Up Markets / Benchmark Return in Up Markets',
+        'description': 'Measures how much of the benchmark\'s gains the fund captures when markets rise.',
+        'interpretation': '> 100% means fund gains more than benchmark in up markets. 110% captures 110% of gains.'
+    },
+    'Down Capture': {
+        'name': 'Down Capture Ratio',
+        'formula': 'Down Capture = Fund Return in Down Markets / Benchmark Return in Down Markets',
+        'description': 'Measures how much of the benchmark\'s losses the fund experiences when markets fall.',
+        'interpretation': '< 100% is good - fund loses less than benchmark. 80% means only 80% of market losses.'
+    },
+    'VaR': {
+        'name': 'Value at Risk (VaR 95%)',
+        'formula': 'VaR 95% = 5th Percentile of Daily Returns',
+        'description': 'The maximum expected loss over a day with 95% confidence.',
+        'interpretation': 'A -2% VaR means 95% of the time, daily loss won\'t exceed 2%.'
+    },
+    'Rolling Return': {
+        'name': 'Rolling Return',
+        'formula': 'Rolling Return = (NAV at end / NAV at start) - 1 for each rolling window',
+        'description': 'Returns calculated over overlapping periods. Shows return consistency over time.',
+        'interpretation': 'More stable rolling returns indicate consistent performance.'
+    },
+    'Hit Rate': {
+        'name': 'Hit Rate',
+        'formula': 'Hit Rate = Number of Correct Picks / Total Picks',
+        'description': 'Percentage of times the selected funds were among the actual top performers.',
+        'interpretation': '> 50% is better than random. 60%+ indicates good predictive ability.'
+    },
+    'Consistency Score': {
+        'name': 'Consistency Score',
+        'formula': 'Consistency = Beat% × (1 + Avg Outperformance) / (1 + |Avg Underperformance|)',
+        'description': 'Combined measure of how often fund beats benchmark and by how much.',
+        'interpretation': 'Higher is better. Rewards both frequency and magnitude of outperformance.'
+    }
+}
+
+STRATEGY_DEFINITIONS = {
+    'momentum': {
+        'name': '🚀 Momentum Strategy',
+        'short_desc': 'Ranks funds by weighted average of 3M, 6M, 12M returns (risk-adjusted).',
+        'full_desc': '''
+**How it works:**
+1. Calculate returns over 3 months, 6 months, and 12 months for each fund
+2. Combine these returns using weights (default: 33% each)
+3. Optionally divide by volatility to get risk-adjusted momentum
+4. Select top N funds with highest momentum score
+
+**Formula:**
+```
+Momentum Score = (w1 × 3M Return) + (w2 × 6M Return) + (w3 × 12M Return)
+Risk-Adjusted = Momentum Score / Annualized Volatility
+```
+
+**Why it works:**
+- Based on the momentum anomaly: past winners tend to continue winning
+- Works best in trending markets
+- Risk-adjustment helps avoid high-flying but risky funds
+
+**Best used when:** Markets are trending, either up or down
+**Weakness:** Performs poorly at market turning points (momentum crash)
+        ''',
+        'params': ['w_3m (3-month weight)', 'w_6m (6-month weight)', 'w_12m (12-month weight)', 'risk_adjust (True/False)']
+    },
+    'sharpe': {
+        'name': '⚖️ Sharpe Ratio Strategy',
+        'short_desc': 'Ranks funds by Sharpe Ratio (excess return per unit of risk).',
+        'full_desc': '''
+**How it works:**
+1. Calculate daily returns for each fund over lookback period
+2. Compute excess returns (returns minus risk-free rate)
+3. Calculate Sharpe Ratio = Mean Excess Return / Std Dev × √252
+4. Select top N funds with highest Sharpe Ratio
+
+**Formula:**
+```
+Sharpe Ratio = (Mean Daily Return - Daily Risk Free Rate) / Std Dev × √252
+```
+
+**Why it works:**
+- Balances return with risk
+- Penalizes funds that achieve returns through excessive risk
+- Classic portfolio optimization metric
+
+**Best used when:** You want consistent, risk-adjusted performance
+**Weakness:** Assumes normal distribution of returns, penalizes upside volatility too
+        ''',
+        'params': ['lookback period (default: available history in lookback window)']
+    },
+    'sortino': {
+        'name': '🎯 Sortino Ratio Strategy',
+        'short_desc': 'Ranks funds by Sortino Ratio (return per unit of downside risk).',
+        'full_desc': '''
+**How it works:**
+1. Calculate daily returns for each fund
+2. Compute downside deviation (std dev of only negative returns)
+3. Calculate Sortino = Mean Excess Return / Downside Deviation × √252
+4. Select top N funds with highest Sortino Ratio
+
+**Formula:**
+```
+Sortino Ratio = (Mean Return - Risk Free Rate) / Downside Deviation × √252
+Downside Deviation = StdDev(Returns where Return < 0)
+```
+
+**Why it works:**
+- Only penalizes downside volatility, not upside
+- Better for asymmetric return distributions
+- More appropriate for funds that might have occasional large gains
+
+**Best used when:** Returns are not normally distributed, you care more about downside
+**Weakness:** Requires enough negative return days to calculate properly
+        ''',
+        'params': ['lookback period']
+    },
+    'regime_switch': {
+        'name': '🚦 Regime Switch Strategy',
+        'short_desc': 'Uses Momentum in bull markets, Sharpe in bear markets.',
+        'full_desc': '''
+**How it works:**
+1. Determine market regime using 200-day moving average of benchmark
+2. If benchmark price > 200 DMA → Bull Market → Use Momentum
+3. If benchmark price < 200 DMA → Bear Market → Use Sharpe Ratio
+4. Select top N funds based on the regime-appropriate metric
+
+**Formula:**
+```
+If Current Price > 200-day MA:
+    Regime = "Bull" → Score = Momentum Score
+Else:
+    Regime = "Bear" → Score = Sharpe Ratio
+```
+
+**Why it works:**
+- Momentum works best in trending (bull) markets
+- Risk-adjusted metrics like Sharpe work better in volatile/bear markets
+- Adapts to changing market conditions
+
+**Best used when:** Markets alternate between trending and ranging periods
+**Weakness:** Can whipsaw if price oscillates around the 200 DMA
+        ''',
+        'params': ['200-day MA for regime detection']
+    },
+    'stable_momentum': {
+        'name': '⚓ Stable Momentum Strategy',
+        'short_desc': 'Selects high momentum funds with lowest drawdown.',
+        'full_desc': '''
+**How it works:**
+1. Calculate momentum scores for all funds
+2. Select top 2×N funds by momentum (create a pool)
+3. From this pool, calculate maximum drawdown for each fund
+4. Select final N funds with the smallest (least negative) drawdowns
+
+**Formula:**
+```
+Step 1: Pool = Top 2N funds by Momentum Score
+Step 2: For each fund in Pool, calculate Max Drawdown
+Step 3: Final Selection = Top N funds with smallest |Max Drawdown|
+```
+
+**Why it works:**
+- Gets exposure to momentum while controlling for crash risk
+- Funds with lower drawdowns tend to compound better
+- Avoids the most volatile momentum names
+
+**Best used when:** You want momentum exposure with risk control
+**Weakness:** May miss the highest returning (but volatile) funds
+        ''',
+        'params': ['momentum weights', 'pool size (2×N)']
+    },
+    'elimination': {
+        'name': '🛡️ Elimination Strategy',
+        'short_desc': 'Eliminates worst 25% by drawdown & volatility, picks top by Sharpe.',
+        'full_desc': '''
+**How it works:**
+1. Calculate Max Drawdown, Volatility, and Sharpe for all funds
+2. Eliminate bottom 25% by drawdown (worst drawdowns removed)
+3. From remaining, eliminate top 25% by volatility (most volatile removed)
+4. From remaining pool, select top N by Sharpe Ratio
+
+**Formula:**
+```
+Step 1: Remove funds with Max DD < 25th percentile (worst 25%)
+Step 2: Remove funds with Volatility > 75th percentile (top 25% volatile)
+Step 3: From remaining, select Top N by Sharpe Ratio
+```
+
+**Why it works:**
+- Multi-factor elimination reduces risk from multiple angles
+- Focuses on funds that are "good enough" across multiple metrics
+- Final Sharpe selection ensures quality from filtered pool
+
+**Best used when:** You want to avoid blow-ups at all costs
+**Weakness:** May eliminate funds that have high returns despite volatility
+        ''',
+        'params': ['drawdown percentile (25%)', 'volatility percentile (75%)']
+    },
+    'consistency': {
+        'name': '📈 Consistency Strategy',
+        'short_desc': 'Requires fund to be top 50% for 3+ of last 4 quarters.',
+        'full_desc': '''
+**How it works:**
+1. Look at last 4 quarters of performance
+2. For each quarter, check if fund was in top 50% of all funds
+3. Keep only funds that were top 50% in at least 3 of 4 quarters
+4. From these consistent funds, select top N by recent momentum
+
+**Formula:**
+```
+For each fund:
+    quarters_good = count(quarters where fund rank <= median)
+    If quarters_good >= 3: Add to consistent_pool
+    
+Final Selection = Top N from consistent_pool by 3-month momentum
+```
+
+**Why it works:**
+- Filters for funds that perform well consistently, not just occasionally
+- Avoids one-hit wonders that had one great period
+- Recent momentum tie-breaker ensures current strength
+
+**Best used when:** You value consistency over occasional outperformance
+**Weakness:** May miss funds that are improving but weren't consistent historically
+        ''',
+        'params': ['quarters to check (4)', 'consistency threshold (3/4)']
+    }
+}
+
+# ============================================================================
 # 3. HELPER FUNCTIONS
 # ============================================================================
 
@@ -102,16 +400,47 @@ def clean_weekday_data(df):
         df = df.reindex(all_weekdays).ffill(limit=5)
     return df
 
+def show_metric_definitions():
+    """Display metric definitions in an expander."""
+    with st.expander("📖 **Metric Definitions & Formulas** (Click to expand)", expanded=False):
+        st.markdown("### Understanding the Metrics")
+        
+        cols = st.columns(2)
+        metrics_list = list(METRIC_DEFINITIONS.items())
+        
+        for idx, (key, metric) in enumerate(metrics_list):
+            with cols[idx % 2]:
+                st.markdown(f"""
+                <div class="metric-explanation">
+                    <h4>{metric['name']}</h4>
+                    <div class="formula-box">{metric['formula']}</div>
+                    <p><strong>What it measures:</strong> {metric['description']}</p>
+                    <p><strong>How to interpret:</strong> {metric['interpretation']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+def show_strategy_explanation(strategy_key):
+    """Display detailed strategy explanation."""
+    if strategy_key in STRATEGY_DEFINITIONS:
+        strat = STRATEGY_DEFINITIONS[strategy_key]
+        with st.expander(f"📚 **Understanding {strat['name']}** (Click for detailed explanation)", expanded=False):
+            st.markdown(strat['full_desc'])
+            st.markdown("**Parameters used:**")
+            for param in strat['params']:
+                st.markdown(f"- {param}")
+
 # ============================================================================
 # 4. METRIC CALCULATIONS
 # ============================================================================
 
 def calculate_sharpe_ratio(returns):
+    """Calculate annualized Sharpe Ratio."""
     if len(returns) < 10 or returns.std() == 0: return np.nan
     excess_returns = returns - DAILY_RISK_FREE_RATE
     return (excess_returns.mean() / returns.std()) * np.sqrt(TRADING_DAYS_YEAR)
 
 def calculate_sortino_ratio(returns):
+    """Calculate annualized Sortino Ratio using downside deviation."""
     if len(returns) < 10: return np.nan
     downside = returns[returns < 0]
     if len(downside) == 0 or downside.std() == 0: return np.nan
@@ -119,10 +448,12 @@ def calculate_sortino_ratio(returns):
     return (mean_return / downside.std()) * np.sqrt(TRADING_DAYS_YEAR)
 
 def calculate_volatility(returns):
+    """Calculate annualized volatility (standard deviation)."""
     if len(returns) < 10: return np.nan
     return returns.std() * np.sqrt(TRADING_DAYS_YEAR)
 
 def calculate_max_dd(series):
+    """Calculate maximum drawdown from a price series."""
     if len(series) < 10 or series.isna().all(): return np.nan
     comp_ret = (1 + series.pct_change().fillna(0)).cumprod()
     peak = comp_ret.expanding(min_periods=1).max()
@@ -130,12 +461,14 @@ def calculate_max_dd(series):
     return dd.min()
 
 def calculate_cagr(series):
+    """Calculate Compound Annual Growth Rate."""
     if len(series) < 30 or series.iloc[0] <= 0: return np.nan
     years = (series.index[-1] - series.index[0]).days / 365.25
     if years <= 0: return np.nan
     return (series.iloc[-1] / series.iloc[0]) ** (1 / years) - 1
 
 def calculate_calmar_ratio(series):
+    """Calculate Calmar Ratio (CAGR / Max Drawdown)."""
     if len(series) < 252: return np.nan
     max_dd = calculate_max_dd(series)
     if pd.isna(max_dd) or max_dd >= 0: return np.nan
@@ -145,6 +478,7 @@ def calculate_calmar_ratio(series):
     return cagr / abs(max_dd)
 
 def calculate_martin_ratio(series):
+    """Calculate Martin Ratio (CAGR / Ulcer Index)."""
     if len(series) < 30: return np.nan
     cum_max = series.expanding(min_periods=1).max()
     drawdowns = (series / cum_max) - 1
@@ -156,6 +490,7 @@ def calculate_martin_ratio(series):
     return (cagr - RISK_FREE_RATE) / ulcer_index
 
 def calculate_beta_alpha(fund_returns, bench_returns):
+    """Calculate Beta and Jensen's Alpha."""
     common_idx = fund_returns.index.intersection(bench_returns.index)
     if len(common_idx) < 60: return np.nan, np.nan
     f_ret, b_ret = fund_returns.loc[common_idx], bench_returns.loc[common_idx]
@@ -166,6 +501,7 @@ def calculate_beta_alpha(fund_returns, bench_returns):
     return beta, alpha
 
 def calculate_information_ratio(fund_returns, bench_returns):
+    """Calculate Information Ratio."""
     common_idx = fund_returns.index.intersection(bench_returns.index)
     if len(common_idx) < 30: return np.nan
     active_return = fund_returns.loc[common_idx] - bench_returns.loc[common_idx]
@@ -174,6 +510,7 @@ def calculate_information_ratio(fund_returns, bench_returns):
     return (active_return.mean() * TRADING_DAYS_YEAR) / tracking_error
 
 def calculate_capture_score(fund_rets, bench_rets):
+    """Calculate Up Capture and Down Capture ratios."""
     common_idx = fund_rets.index.intersection(bench_rets.index)
     if len(common_idx) < 30: return np.nan, np.nan, np.nan
     f, b = fund_rets.loc[common_idx], bench_rets.loc[common_idx]
@@ -184,6 +521,7 @@ def calculate_capture_score(fund_rets, bench_rets):
     return up_cap, down_cap, ratio
 
 def calculate_rolling_metrics(series, benchmark_series, window_days):
+    """Calculate rolling return metrics."""
     if len(series) < window_days + 30: return np.nan, np.nan, np.nan, np.nan, np.nan
     fund_rolling = series.pct_change(window_days).dropna()
     bench_rolling = benchmark_series.pct_change(window_days).dropna()
@@ -331,7 +669,7 @@ def calculate_quarterly_ranks(nav_df, scheme_map):
     return rank_df
 
 # ============================================================================
-# 7. VISUALIZATION HELPERS
+# 7. VISUALIZATION
 # ============================================================================
 
 def create_performance_chart(nav_df, selected_funds, scheme_map, benchmark_series=None, normalize=True):
@@ -384,6 +722,9 @@ def render_explorer_tab():
         <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Comprehensive fund analysis with rolling metrics</p>
     </div>
     """, unsafe_allow_html=True)
+    
+    # Show metric definitions at the top
+    show_metric_definitions()
     
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1: category = st.selectbox("📁 Select Category", list(FILE_MAPPING.keys()))
@@ -600,7 +941,7 @@ def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, mom
         
         history.append({'date': date, 'selected': selected, 'return': port_ret, 'hit_rate': hit_rate, 'regime': regime_status})
         
-        # Build detailed trade record with ALL fund names dynamically
+        # Build detailed trade record with ALL fund names
         trade_record = {
             'Period Start': date.strftime('%Y-%m-%d'),
             'Period End': nav.index[exit_i].strftime('%Y-%m-%d'),
@@ -611,7 +952,6 @@ def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, mom
             'Hit Rate %': hit_rate * 100,
         }
         
-        # Add ALL selected funds dynamically
         for idx, fund_id in enumerate(selected):
             fund_name = scheme_map.get(fund_id, fund_id)
             fund_return = period_ret_all.get(fund_id, np.nan)
@@ -620,7 +960,6 @@ def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, mom
             trade_record[f'Fund {idx+1} Return %'] = fund_return * 100 if not pd.isna(fund_return) else np.nan
             trade_record[f'Fund {idx+1} Hit'] = '✅' if is_hit else '❌'
         
-        # Add ALL actual top funds dynamically
         for idx, fund_id in enumerate(actual_top_funds):
             fund_name = scheme_map.get(fund_id, fund_id)
             fund_return = period_ret_all.get(fund_id, np.nan)
@@ -634,13 +973,16 @@ def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, mom
     return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve), pd.DataFrame(detailed_trades)
 
 # ============================================================================
-# 10. DISPLAY STRATEGY RESULTS WITH ALL FUND NAMES
+# 10. DISPLAY STRATEGY RESULTS
 # ============================================================================
 
 def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_name, mom_config, top_n, target_n, holding):
-    """Display comprehensive results with ALL fund names for every rebalance period."""
+    """Display comprehensive results with ALL fund names and strategy explanations."""
     
     key_prefix = f"{strat_key}_{holding}_{top_n}_{target_n}"
+    
+    # Show strategy explanation
+    show_strategy_explanation(strat_key)
     
     with st.spinner(f"Running {strat_name} backtest..."):
         history, eq_curve, bench_curve, detailed_trades = run_backtest_detailed(
@@ -651,7 +993,6 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
         st.warning("No trades generated. Insufficient data.")
         return
     
-    # Summary Metrics
     years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
     strat_cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
     bench_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
@@ -665,7 +1006,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
     col4.metric("🏆 Avg Hit Rate", f"{avg_hit*100:.1f}%")
     col5.metric("📋 Total Trades", f"{total_trades}")
     
-    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs(["📈 Equity Curve", "📋 All Trades (Full Detail)", "🎯 Hit Analysis", "📊 Summary View"])
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs(["📈 Equity Curve", "📋 All Trades Detail", "🎯 Hit Analysis", "📊 Summary"])
     
     with sub_tab1:
         fig = go.Figure()
@@ -684,14 +1025,11 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
     
     with sub_tab2:
         st.markdown("### 📋 Complete Trade History - All Selected Funds")
-        st.markdown(f"*Showing all {len(detailed_trades)} trading periods with **all {top_n} selected funds** and **all {target_n} actual top performers***")
+        st.markdown(f"*Showing all {len(detailed_trades)} periods with **all {top_n} selected funds** and **all {target_n} actual top performers***")
         
         if not detailed_trades.empty:
-            # Identify columns for formatting
             pct_cols = [c for c in detailed_trades.columns if 'Return %' in c or 'Rate %' in c]
             hit_cols = [c for c in detailed_trades.columns if 'Hit' in c and 'Rate' not in c]
-            
-            # Create styled dataframe
             format_dict = {col: '{:.2f}' for col in pct_cols}
             format_dict['Hits'] = '{:.0f}'
             
@@ -704,12 +1042,8 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
             for col in hit_cols:
                 if col in detailed_trades.columns:
                     styled_df = styled_df.applymap(highlight_hits, subset=[col])
-            
             st.dataframe(styled_df, use_container_width=True, height=600)
-            
-            # Download button
-            csv_data = detailed_trades.to_csv(index=False)
-            st.download_button(f"📥 Download Full Trade History (CSV)", csv_data, f"{strat_key}_full_trades.csv", "text/csv", key=f"dl_{key_prefix}")
+            st.download_button(f"📥 Download Full Trade History", detailed_trades.to_csv(index=False), f"{strat_key}_trades.csv", "text/csv", key=f"dl_{key_prefix}")
     
     with sub_tab3:
         st.markdown("### 🎯 Hit Rate Analysis")
@@ -721,14 +1055,12 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                 fig = go.Figure(data=[go.Bar(x=[f"{int(k)} hits" for k in hit_counts.index], y=hit_counts.values, marker_color=colors_list)])
                 fig.update_layout(title=f'Distribution of Hits (out of {top_n} picks)', height=300)
                 st.plotly_chart(fig, use_container_width=True, key=f"hd_{key_prefix}")
-                
-                st.markdown("**Hit Rate Statistics:**")
-                for i in range(top_n + 1):
+                st.markdown("**Statistics:**")
+                for i in range(min(top_n + 1, 6)):
                     count = (detailed_trades['Hits'] == i).sum()
                     pct = count / len(detailed_trades) * 100
                     emoji = "🟢" if i >= top_n/2 else "🟡" if i > 0 else "🔴"
-                    st.write(f"{emoji} Periods with exactly {i} hits: {count} ({pct:.1f}%)")
-            
+                    st.write(f"{emoji} {i} hits: {count} ({pct:.1f}%)")
             with col2:
                 hit_periods = detailed_trades[detailed_trades['Hits'] > 0]['Portfolio Return %']
                 miss_periods = detailed_trades[detailed_trades['Hits'] == 0]['Portfolio Return %']
@@ -737,51 +1069,35 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                 if len(miss_periods) > 0: fig.add_trace(go.Box(y=miss_periods, name='No Hits', marker_color='red'))
                 fig.update_layout(title='Returns: Hits vs No Hits', yaxis_title='Return %', height=300)
                 st.plotly_chart(fig, use_container_width=True, key=f"hr2_{key_prefix}")
-                
-                st.markdown("**Return Statistics:**")
-                if len(hit_periods) > 0: st.write(f"🟢 Avg return when hitting: {hit_periods.mean():.2f}%")
-                if len(miss_periods) > 0: st.write(f"🔴 Avg return when missing: {miss_periods.mean():.2f}%")
-                st.write(f"📊 Overall avg return: {detailed_trades['Portfolio Return %'].mean():.2f}%")
+                st.markdown("**Return Stats:**")
+                if len(hit_periods) > 0: st.write(f"🟢 Avg when hitting: {hit_periods.mean():.2f}%")
+                if len(miss_periods) > 0: st.write(f"🔴 Avg when missing: {miss_periods.mean():.2f}%")
     
     with sub_tab4:
-        st.markdown("### 📊 Period Summary View")
+        st.markdown("### 📊 Period Summary")
         if not detailed_trades.empty:
             summary_data = []
             for _, row in detailed_trades.iterrows():
-                # Get all selected funds
                 selected_funds = []
                 for i in range(1, top_n + 1):
-                    fund_col = f'Fund {i}'
-                    ret_col = f'Fund {i} Return %'
-                    hit_col = f'Fund {i} Hit'
-                    if fund_col in row and pd.notna(row.get(fund_col)) and row.get(fund_col) != '':
-                        ret = row.get(ret_col, np.nan)
-                        hit = row.get(hit_col, '')
-                        ret_str = f"{ret:.1f}%" if pd.notna(ret) else "N/A"
-                        selected_funds.append(f"{row[fund_col]} ({ret_str}) {hit}")
-                
-                # Get all actual top funds
+                    if f'Fund {i}' in row and pd.notna(row.get(f'Fund {i}')) and row.get(f'Fund {i}') != '':
+                        ret = row.get(f'Fund {i} Return %', np.nan)
+                        hit = row.get(f'Fund {i} Hit', '')
+                        selected_funds.append(f"{row[f'Fund {i}']} ({ret:.1f}%) {hit}" if pd.notna(ret) else f"{row[f'Fund {i}']} {hit}")
                 actual_funds = []
                 for i in range(1, target_n + 1):
-                    fund_col = f'Actual Top {i}'
-                    ret_col = f'Actual Top {i} Return %'
-                    if fund_col in row and pd.notna(row.get(fund_col)) and row.get(fund_col) != '':
-                        ret = row.get(ret_col, np.nan)
-                        ret_str = f"{ret:.1f}%" if pd.notna(ret) else "N/A"
-                        actual_funds.append(f"{row[fund_col]} ({ret_str})")
-                
+                    if f'Actual Top {i}' in row and pd.notna(row.get(f'Actual Top {i}')) and row.get(f'Actual Top {i}') != '':
+                        ret = row.get(f'Actual Top {i} Return %', np.nan)
+                        actual_funds.append(f"{row[f'Actual Top {i}']} ({ret:.1f}%)" if pd.notna(ret) else row[f'Actual Top {i}'])
                 summary_data.append({
                     'Period': f"{row['Period Start']} → {row['Period End']}",
                     'Regime': row.get('Regime', 'N/A'),
-                    'Selected Funds': ' | '.join(selected_funds) if selected_funds else 'None',
+                    'Selected': ' | '.join(selected_funds),
                     'Hits': f"{int(row['Hits'])}/{top_n}",
-                    'Port Ret': f"{row['Portfolio Return %']:.1f}%",
-                    'Bench Ret': f"{row['Benchmark Return %']:.1f}%",
-                    'Actual Top Funds': ' | '.join(actual_funds) if actual_funds else 'None'
+                    'Return': f"{row['Portfolio Return %']:.1f}%",
+                    'Actual Top': ' | '.join(actual_funds)
                 })
-            
-            summary_df = pd.DataFrame(summary_data)
-            st.dataframe(summary_df, use_container_width=True, height=600)
+            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, height=600)
 
 # ============================================================================
 # 11. BACKTEST TAB
@@ -791,15 +1107,28 @@ def render_backtest_tab():
     st.markdown("""
     <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); padding: 20px; border-radius: 12px; margin-bottom: 20px;">
         <h2 style="color: white; margin: 0;">🚀 Strategy Backtester</h2>
-        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Test fund selection strategies with detailed trade-by-trade analysis showing ALL fund names</p>
+        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Test fund selection strategies with detailed explanations and full fund visibility</p>
     </div>
     """, unsafe_allow_html=True)
     
+    # Strategy overview expander
+    with st.expander("📚 **All Strategy Explanations** (Click to expand)", expanded=False):
+        st.markdown("### Understanding Each Strategy")
+        for key, strat in STRATEGY_DEFINITIONS.items():
+            st.markdown(f"""
+            <div class="strategy-card">
+                <h4>{strat['name']}</h4>
+                <p><strong>Quick Summary:</strong> {strat['short_desc']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.expander(f"See full details for {strat['name']}"):
+                st.markdown(strat['full_desc'])
+    
     col1, col2, col3, col4 = st.columns(4)
     with col1: category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()), key="bt_cat")
-    with col2: top_n = st.number_input("🎯 Funds to Select", 1, 15, 3, key="bt_topn")
-    with col3: target_n = st.number_input("🏆 Target Top N", 1, 20, 5, key="bt_target")
-    with col4: holding = st.selectbox("📅 Holding Period", [63, 126, 252, 378, 504], index=1, format_func=lambda x: f"{x} days (~{x//21}M)")
+    with col2: top_n = st.number_input("🎯 Funds to Select", 1, 15, 3, key="bt_topn", help="Number of funds the strategy will pick each period")
+    with col3: target_n = st.number_input("🏆 Target Top N", 1, 20, 5, key="bt_target", help="Number of actual top performers to compare against (for hit rate)")
+    with col4: holding = st.selectbox("📅 Holding Period", [63, 126, 252, 378, 504], index=1, format_func=lambda x: f"{x} days (~{x//21}M)", help="How long to hold before rebalancing")
     
     st.divider()
     
@@ -812,7 +1141,7 @@ def render_backtest_tab():
         return
     
     st.success(f"✅ Loaded {len(nav_df.columns)} funds | Data: {nav_df.index.min().strftime('%Y-%m')} to {nav_df.index.max().strftime('%Y-%m')}")
-    st.info(f"📊 Will show **all {top_n} selected funds** and **all {target_n} actual top performers** for each rebalance period")
+    st.info(f"📊 Each period will show **all {top_n} selected funds** vs **actual top {target_n} performers**")
     
     strategies = {
         '🚀 Momentum': ('momentum', {'w_3m': 0.33, 'w_6m': 0.33, 'w_12m': 0.33, 'risk_adjust': True}),
@@ -829,22 +1158,12 @@ def render_backtest_tab():
     for idx, (tab_name, (strat_key, mom_config)) in enumerate(strategies.items()):
         with tabs[idx]:
             st.markdown(f"### {tab_name} Strategy")
-            descriptions = {
-                'momentum': "Ranks funds by weighted average of 3M, 6M, 12M returns (risk-adjusted).",
-                'sharpe': "Ranks funds by Sharpe Ratio (excess return / volatility).",
-                'sortino': "Ranks funds by Sortino Ratio (excess return / downside volatility).",
-                'regime_switch': "Uses Momentum in bull markets (price > 200 DMA), Sharpe in bear markets.",
-                'stable_momentum': "Selects top momentum funds, then filters for lowest drawdown.",
-                'elimination': "Eliminates worst 25% by drawdown & volatility, picks top by Sharpe.",
-                'consistency': "Requires fund to be top 50% for 3+ of last 4 quarters, picks by momentum."
-            }
-            st.info(f"📌 **Logic:** {descriptions.get(strat_key, 'Custom strategy')}")
+            st.info(f"📌 **Quick Summary:** {STRATEGY_DEFINITIONS[strat_key]['short_desc']}")
             display_strategy_results(nav_df, scheme_map, benchmark, strat_key, tab_name, mom_config, top_n, target_n, holding)
     
     # Compare All tab
     with tabs[-1]:
         st.markdown("### 📊 Strategy Comparison")
-        st.markdown("*Compare all strategies side by side*")
         
         results, all_equity_curves, last_bench = [], {}, None
         progress = st.progress(0)
@@ -857,10 +1176,10 @@ def render_backtest_tab():
                 bench_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
                 max_dd = calculate_max_dd(pd.Series(eq_curve['value'].values, index=eq_curve['date']))
                 results.append({
-                    'Strategy': name, 'CAGR %': cagr * 100, 'Benchmark CAGR %': bench_cagr * 100,
+                    'Strategy': name, 'CAGR %': cagr * 100, 'Benchmark %': bench_cagr * 100,
                     'Alpha %': (cagr - bench_cagr) * 100, 'Max DD %': max_dd * 100 if max_dd else 0,
                     'Hit Rate %': history['hit_rate'].mean() * 100, 'Win Rate %': (history['return'] > 0).mean() * 100,
-                    'Avg Return %': history['return'].mean() * 100, 'Trades': len(history)
+                    'Trades': len(history)
                 })
                 all_equity_curves[name] = eq_curve
                 last_bench = bench_curve
@@ -868,12 +1187,10 @@ def render_backtest_tab():
         progress.empty()
         
         if results:
-            results_df = pd.DataFrame(results).sort_values('CAGR %', ascending=False)
-            st.dataframe(results_df.style.format({
-                'CAGR %': '{:.2f}', 'Benchmark CAGR %': '{:.2f}', 'Alpha %': '{:+.2f}',
-                'Max DD %': '{:.2f}', 'Hit Rate %': '{:.1f}', 'Win Rate %': '{:.1f}',
-                'Avg Return %': '{:.2f}', 'Trades': '{:.0f}'
-            }).background_gradient(subset=['CAGR %', 'Alpha %'], cmap='RdYlGn').background_gradient(subset=['Hit Rate %'], cmap='Greens'), use_container_width=True)
+            st.dataframe(pd.DataFrame(results).sort_values('CAGR %', ascending=False).style.format({
+                'CAGR %': '{:.2f}', 'Benchmark %': '{:.2f}', 'Alpha %': '{:+.2f}',
+                'Max DD %': '{:.2f}', 'Hit Rate %': '{:.1f}', 'Win Rate %': '{:.1f}'
+            }).background_gradient(subset=['CAGR %', 'Alpha %'], cmap='RdYlGn'), use_container_width=True)
         
         fig = go.Figure()
         colors = px.colors.qualitative.Set2
@@ -881,16 +1198,9 @@ def render_backtest_tab():
             fig.add_trace(go.Scatter(x=eq_curve['date'], y=eq_curve['value'], name=name, line=dict(color=colors[idx % len(colors)], width=2)))
         if last_bench is not None:
             fig.add_trace(go.Scatter(x=last_bench['date'], y=last_bench['value'], name='Benchmark', line=dict(color='black', width=2, dash='dot')))
-        fig.update_layout(height=500, title='Strategy Comparison', yaxis_title='Value', hovermode='x unified',
+        fig.update_layout(height=500, title='All Strategies vs Benchmark', yaxis_title='Value', hovermode='x unified',
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5))
         st.plotly_chart(fig, use_container_width=True, key="compare_eq")
-        
-        if results:
-            fig2 = go.Figure(data=[go.Bar(x=[r['Strategy'] for r in results], y=[r['Hit Rate %'] for r in results],
-                marker_color=[colors[i % len(colors)] for i in range(len(results))],
-                text=[f"{r['Hit Rate %']:.1f}%" for r in results], textposition='outside')])
-            fig2.update_layout(height=350, title='Hit Rate by Strategy', yaxis_title='Hit Rate %')
-            st.plotly_chart(fig2, use_container_width=True, key="compare_hr")
 
 # ============================================================================
 # 12. MAIN APP
@@ -900,7 +1210,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; padding: 10px 0 20px 0;">
         <h1 style="margin: 0; border: none;">📈 Fund Analysis Pro</h1>
-        <p style="color: #666; margin: 5px 0 0 0;">Comprehensive mutual fund analysis and backtesting with full fund name visibility</p>
+        <p style="color: #666; margin: 5px 0 0 0;">Comprehensive mutual fund analysis with full strategy explanations</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -910,7 +1220,7 @@ def main():
     
     st.markdown("""
     <div style="text-align: center; padding: 20px; color: #999; font-size: 0.8rem; margin-top: 40px; border-top: 1px solid #eee;">
-        Fund Analysis Pro • Data through Dec 2025 • Risk-free rate: 6%
+        Fund Analysis Pro • Risk-free rate: 6% • Data through Dec 2025
     </div>
     """, unsafe_allow_html=True)
 
