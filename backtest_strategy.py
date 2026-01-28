@@ -1212,14 +1212,440 @@ def run_backtest(nav, strategy_type, top_n, target_n, holding_days, custom_weigh
     
     return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve)
 
+def run_backtest_detailed(nav, strategy_type, top_n, target_n, holding_days, custom_weights, momentum_config, benchmark_series, scheme_map, ensemble_weights=None):
+    """Enhanced backtest that returns detailed fund selections and actual top performers."""
+    start_date = nav.index.min() + pd.Timedelta(days=370)
+    if start_date >= nav.index.max():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
+    start_idx = nav.index.searchsorted(start_date)
+    rebal_idx = list(range(start_idx, len(nav) - 1, holding_days))
+    
+    if not rebal_idx: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
+    history, eq_curve, bench_curve = [], [{'date': nav.index[rebal_idx[0]], 'value': 100.0}], [{'date': nav.index[rebal_idx[0]], 'value': 100.0}]
+    detailed_trades = []
+    cap, b_cap = 100.0, 100.0
+    
+    for i in rebal_idx:
+        date = nav.index[i]
+        hist = get_lookback_data(nav, date)
+        
+        bench_rets = None
+        if benchmark_series is not None:
+            try:
+                b_slice = get_lookback_data(benchmark_series.to_frame(), date)
+                bench_rets = b_slice['nav'].pct_change().dropna()
+            except: pass
+        
+        scores = {}
+        selected = []
+        regime_status = "neutral"
+        
+        # Strategy implementations
+        if strategy_type in ['momentum', 'sharpe', 'sortino']:
+            for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 126: continue
+                rets = s.pct_change().dropna()
+                
+                if strategy_type == 'momentum':
+                    val = calculate_flexible_momentum(s, momentum_config.get('w_3m', 0.33), 
+                                                     momentum_config.get('w_6m', 0.33), 
+                                                     momentum_config.get('w_12m', 0.33),
+                                                     momentum_config.get('risk_adjust', False))
+                elif strategy_type == 'sharpe':
+                    val = calculate_sharpe_ratio(rets)
+                elif strategy_type == 'sortino':
+                    val = calculate_sortino_ratio(rets)
+                
+                if not pd.isna(val): scores[col] = val
+            selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+        
+        elif strategy_type == 'regime_switch':
+            if benchmark_series is not None:
+                regime = get_market_regime(benchmark_series, date)
+                regime_status = regime
+                
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) < 126: continue
+                    
+                    if regime == 'bull':
+                        val = calculate_flexible_momentum(s, 0.3, 0.3, 0.4, False)
+                    else:
+                        val = calculate_sharpe_ratio(s.pct_change().dropna())
+                    
+                    if not pd.isna(val): scores[col] = val
+                selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
+        
+        elif strategy_type == 'stable_momentum':
+            mom_scores = {}
+            for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) >= 260:
+                    val = calculate_flexible_momentum(s, 0.33, 0.33, 0.33, False)
+                    if not pd.isna(val): mom_scores[col] = val
+            
+            pool = sorted(mom_scores, key=mom_scores.get, reverse=True)[:top_n*2]
+            
+            dd_scores = {}
+            for col in pool:
+                dd = calculate_max_dd(hist[col].dropna())
+                if not pd.isna(dd): dd_scores[col] = dd
+            selected = sorted(dd_scores, key=dd_scores.get, reverse=True)[:top_n]
+        
+        elif strategy_type == 'elimination':
+            # Elimination strategy
+            fund_data = {}
+            for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 200: continue
+                rets = s.pct_change().dropna()
+                fund_data[col] = {
+                    'max_dd': calculate_max_dd(s),
+                    'volatility': calculate_volatility(rets),
+                    'momentum_6m': (s.iloc[-1] / s.iloc[-126] - 1) if len(s) >= 126 else np.nan,
+                    'sharpe': calculate_sharpe_ratio(rets)
+                }
+            
+            if fund_data:
+                df = pd.DataFrame(fund_data).T.dropna()
+                if len(df) > top_n * 2:
+                    # Eliminate worst drawdowns
+                    dd_threshold = df['max_dd'].quantile(0.25)
+                    df = df[df['max_dd'] >= dd_threshold]
+                    
+                    # Eliminate highest volatility
+                    if len(df) > top_n * 2:
+                        vol_threshold = df['volatility'].quantile(0.75)
+                        df = df[df['volatility'] <= vol_threshold]
+                    
+                    # Pick top by Sharpe
+                    selected = df.nlargest(top_n, 'sharpe').index.tolist()
+                else:
+                    selected = df.nlargest(top_n, 'sharpe').index.tolist() if len(df) > 0 else []
+        
+        elif strategy_type == 'consistency':
+            # Consistency-first strategy
+            consistent_funds = []
+            for col in nav.columns:
+                s = hist[col].dropna()
+                if len(s) < 300: continue
+                
+                quarters_good = 0
+                for q in range(4):
+                    q_end = date - pd.Timedelta(days=q * 91)
+                    q_start = q_end - pd.Timedelta(days=91)
+                    try:
+                        idx_s = hist.index.asof(q_start)
+                        idx_e = hist.index.asof(q_end)
+                        if pd.isna(idx_s) or pd.isna(idx_e): continue
+                        all_rets = (hist.loc[idx_e] / hist.loc[idx_s] - 1).dropna()
+                        if col in all_rets.index and all_rets[col] >= all_rets.median():
+                            quarters_good += 1
+                    except: continue
+                
+                if quarters_good >= 3:
+                    consistent_funds.append(col)
+            
+            if consistent_funds:
+                mom_scores = {}
+                for col in consistent_funds:
+                    s = hist[col].dropna()
+                    if len(s) >= 63:
+                        mom_scores[col] = (s.iloc[-1] / s.iloc[-63] - 1)
+                selected = sorted(mom_scores, key=mom_scores.get, reverse=True)[:top_n] if mom_scores else []
+            else:
+                # Fallback to momentum
+                for col in nav.columns:
+                    s = hist[col].dropna()
+                    if len(s) >= 126:
+                        scores[col] = calculate_flexible_momentum(s, 0.33, 0.33, 0.33, False)
+                selected = sorted([k for k,v in scores.items() if not pd.isna(v)], 
+                                 key=lambda x: scores[x], reverse=True)[:top_n]
+        
+        # Execution
+        entry = i + 1
+        exit_i = min(i + 1 + holding_days, len(nav) - 1)
+        
+        b_ret = 0.0
+        if benchmark_series is not None:
+            try: b_ret = (benchmark_series.asof(nav.index[exit_i]) / benchmark_series.asof(nav.index[entry])) - 1
+            except: pass
+        
+        port_ret = 0.0
+        hit_rate = 0.0
+        hits = 0
+        
+        # Calculate returns and get actual top performers
+        period_ret_all = (nav.iloc[exit_i] / nav.iloc[entry]) - 1
+        period_ret_all = period_ret_all.dropna()
+        
+        actual_top_funds = period_ret_all.nlargest(target_n).index.tolist()
+        actual_top_names = [scheme_map.get(f, f) for f in actual_top_funds]
+        actual_top_returns = [period_ret_all[f] for f in actual_top_funds]
+        
+        if selected:
+            port_ret = period_ret_all[selected].mean()
+            hits = len(set(selected).intersection(set(actual_top_funds)))
+            hit_rate = hits / top_n if top_n > 0 else 0
+        
+        cap *= (1 + (port_ret if not pd.isna(port_ret) else 0))
+        b_cap *= (1 + b_ret)
+        
+        # Store basic history
+        history.append({
+            'date': date,
+            'selected': selected,
+            'return': port_ret,
+            'hit_rate': hit_rate,
+            'regime': regime_status
+        })
+        
+        # Store detailed trade info
+        selected_names = [scheme_map.get(f, f) for f in selected]
+        selected_returns = [period_ret_all.get(f, np.nan) for f in selected]
+        
+        # Check which selected funds were hits
+        selected_hits = [f in actual_top_funds for f in selected]
+        
+        detailed_trades.append({
+            'Period Start': date.strftime('%Y-%m-%d'),
+            'Period End': nav.index[exit_i].strftime('%Y-%m-%d'),
+            'Regime': regime_status,
+            'Selected Fund 1': selected_names[0] if len(selected_names) > 0 else '',
+            'Return 1': selected_returns[0] if len(selected_returns) > 0 else np.nan,
+            'Hit 1': '✅' if len(selected_hits) > 0 and selected_hits[0] else '❌',
+            'Selected Fund 2': selected_names[1] if len(selected_names) > 1 else '',
+            'Return 2': selected_returns[1] if len(selected_returns) > 1 else np.nan,
+            'Hit 2': '✅' if len(selected_hits) > 1 and selected_hits[1] else '❌',
+            'Selected Fund 3': selected_names[2] if len(selected_names) > 2 else '',
+            'Return 3': selected_returns[2] if len(selected_returns) > 2 else np.nan,
+            'Hit 3': '✅' if len(selected_hits) > 2 and selected_hits[2] else '❌',
+            'Portfolio Return': port_ret,
+            'Benchmark Return': b_ret,
+            'Hits': hits,
+            'Hit Rate': hit_rate,
+            'Actual Top 1': actual_top_names[0] if len(actual_top_names) > 0 else '',
+            'Actual Return 1': actual_top_returns[0] if len(actual_top_returns) > 0 else np.nan,
+            'Actual Top 2': actual_top_names[1] if len(actual_top_names) > 1 else '',
+            'Actual Return 2': actual_top_returns[1] if len(actual_top_returns) > 1 else np.nan,
+            'Actual Top 3': actual_top_names[2] if len(actual_top_names) > 2 else '',
+            'Actual Return 3': actual_top_returns[2] if len(actual_top_returns) > 2 else np.nan,
+        })
+        
+        eq_curve.append({'date': nav.index[exit_i], 'value': cap})
+        bench_curve.append({'date': nav.index[exit_i], 'value': b_cap})
+    
+    return pd.DataFrame(history), pd.DataFrame(eq_curve), pd.DataFrame(bench_curve), pd.DataFrame(detailed_trades)
+
+
+def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_name, mom_config, top_n, target_n, holding):
+    """Display comprehensive results for a strategy including detailed trade history."""
+    
+    with st.spinner(f"Running {strat_name} backtest..."):
+        history, eq_curve, bench_curve, detailed_trades = run_backtest_detailed(
+            nav_df, strat_key, top_n, target_n, holding, {}, mom_config, benchmark, scheme_map
+        )
+    
+    if eq_curve.empty:
+        st.warning("No trades generated. Insufficient data.")
+        return
+    
+    # Summary Metrics
+    years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
+    strat_cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+    bench_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+    avg_hit = history['hit_rate'].mean()
+    total_trades = len(history)
+    total_hits = int(detailed_trades['Hits'].sum()) if 'Hits' in detailed_trades.columns else 0
+    
+    # Metrics row
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("📈 Strategy CAGR", f"{strat_cagr*100:.2f}%")
+    col2.metric("📊 Benchmark CAGR", f"{bench_cagr*100:.2f}%")
+    col3.metric("🎯 Outperformance", f"{(strat_cagr-bench_cagr)*100:+.2f}%")
+    col4.metric("🏆 Avg Hit Rate", f"{avg_hit*100:.1f}%")
+    col5.metric("📋 Total Trades", f"{total_trades}")
+    
+    # Sub-tabs for different views
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
+        "📈 Equity Curve", 
+        "📋 All Trades Detail", 
+        "🎯 Hit Analysis",
+        "📊 Period Summary"
+    ])
+    
+    with sub_tab1:
+        # Equity curve chart
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=eq_curve['date'], y=eq_curve['value'],
+            name='Strategy', line=dict(color='green', width=2),
+            fill='tozeroy', fillcolor='rgba(0, 200, 0, 0.1)'
+        ))
+        fig.add_trace(go.Scatter(
+            x=bench_curve['date'], y=bench_curve['value'],
+            name='Benchmark (Nifty 100)', line=dict(color='gray', width=2, dash='dot')
+        ))
+        fig.update_layout(
+            height=400, 
+            title=f'{strat_name} - Equity Curve',
+            yaxis_title='Value (100 = Start)',
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Hit rate over time chart
+        if not detailed_trades.empty:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=detailed_trades['Period Start'],
+                y=detailed_trades['Hit Rate'] * 100,
+                name='Hit Rate',
+                marker_color=detailed_trades['Hit Rate'].apply(
+                    lambda x: 'green' if x >= 0.5 else 'orange' if x > 0 else 'red'
+                )
+            ))
+            fig2.add_hline(y=avg_hit*100, line_dash="dash", line_color="blue", 
+                          annotation_text=f"Avg: {avg_hit*100:.1f}%")
+            fig2.update_layout(
+                height=300,
+                title='Hit Rate by Period',
+                yaxis_title='Hit Rate %',
+                xaxis_title='Period'
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+    
+    with sub_tab2:
+        st.markdown("### 📋 Complete Trade History")
+        st.markdown(f"*Showing all {len(detailed_trades)} trading periods with selected funds and actual top performers*")
+        
+        if not detailed_trades.empty:
+            # Format the display
+            display_df = detailed_trades.copy()
+            
+            # Create a cleaner view
+            st.dataframe(
+                display_df.style.format({
+                    'Return 1': '{:.2%}',
+                    'Return 2': '{:.2%}',
+                    'Return 3': '{:.2%}',
+                    'Portfolio Return': '{:.2%}',
+                    'Benchmark Return': '{:.2%}',
+                    'Hit Rate': '{:.0%}',
+                    'Actual Return 1': '{:.2%}',
+                    'Actual Return 2': '{:.2%}',
+                    'Actual Return 3': '{:.2%}',
+                }).applymap(
+                    lambda x: 'background-color: #90EE90' if x == '✅' else 
+                              'background-color: #FFB6C1' if x == '❌' else '',
+                    subset=['Hit 1', 'Hit 2', 'Hit 3']
+                ),
+                use_container_width=True,
+                height=500
+            )
+            
+            # Download button
+            csv = display_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Trade History (CSV)",
+                csv,
+                f"{strat_key}_trade_history.csv",
+                "text/csv"
+            )
+    
+    with sub_tab3:
+        st.markdown("### 🎯 Hit Rate Analysis")
+        
+        if not detailed_trades.empty:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Hit rate distribution
+                hit_counts = detailed_trades['Hits'].value_counts().sort_index()
+                fig = go.Figure(data=[
+                    go.Bar(
+                        x=[f"{int(k)} hits" for k in hit_counts.index],
+                        y=hit_counts.values,
+                        marker_color=['red', 'orange', 'yellow', 'lightgreen', 'green'][:len(hit_counts)]
+                    )
+                ])
+                fig.update_layout(
+                    title=f'Distribution of Hits per Period (out of {top_n} picks)',
+                    height=300
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Summary stats
+                st.markdown("**Hit Rate Statistics:**")
+                st.write(f"- Periods with 0 hits: {(detailed_trades['Hits'] == 0).sum()} ({(detailed_trades['Hits'] == 0).mean()*100:.1f}%)")
+                st.write(f"- Periods with 1+ hits: {(detailed_trades['Hits'] >= 1).sum()} ({(detailed_trades['Hits'] >= 1).mean()*100:.1f}%)")
+                st.write(f"- Periods with 2+ hits: {(detailed_trades['Hits'] >= 2).sum()} ({(detailed_trades['Hits'] >= 2).mean()*100:.1f}%)")
+                if top_n >= 3:
+                    st.write(f"- Periods with 3+ hits: {(detailed_trades['Hits'] >= 3).sum()} ({(detailed_trades['Hits'] >= 3).mean()*100:.1f}%)")
+            
+            with col2:
+                # Returns when hitting vs missing
+                hit_periods = detailed_trades[detailed_trades['Hits'] > 0]['Portfolio Return']
+                miss_periods = detailed_trades[detailed_trades['Hits'] == 0]['Portfolio Return']
+                
+                fig = go.Figure()
+                if len(hit_periods) > 0:
+                    fig.add_trace(go.Box(y=hit_periods * 100, name='Periods with Hits', marker_color='green'))
+                if len(miss_periods) > 0:
+                    fig.add_trace(go.Box(y=miss_periods * 100, name='Periods with No Hits', marker_color='red'))
+                fig.update_layout(title='Returns Distribution: Hits vs No Hits', yaxis_title='Return %', height=300)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.markdown("**Return Statistics:**")
+                if len(hit_periods) > 0:
+                    st.write(f"- Avg return when hitting: {hit_periods.mean()*100:.2f}%")
+                if len(miss_periods) > 0:
+                    st.write(f"- Avg return when missing: {miss_periods.mean()*100:.2f}%")
+                st.write(f"- Overall avg return: {detailed_trades['Portfolio Return'].mean()*100:.2f}%")
+    
+    with sub_tab4:
+        st.markdown("### 📊 Period-by-Period Summary")
+        
+        if not detailed_trades.empty:
+            # Simplified view showing just selections and outcomes
+            summary_data = []
+            for _, row in detailed_trades.iterrows():
+                selected = []
+                for i in range(1, 4):
+                    if row.get(f'Selected Fund {i}', ''):
+                        ret = row.get(f'Return {i}', np.nan)
+                        hit = row.get(f'Hit {i}', '')
+                        selected.append(f"{row[f'Selected Fund {i}'][:25]} ({ret*100:.1f}%) {hit}")
+                
+                actual = []
+                for i in range(1, 4):
+                    if row.get(f'Actual Top {i}', ''):
+                        ret = row.get(f'Actual Return {i}', np.nan)
+                        actual.append(f"{row[f'Actual Top {i}'][:25]} ({ret*100:.1f}%)")
+                
+                summary_data.append({
+                    'Period': f"{row['Period Start']} → {row['Period End']}",
+                    'Selected Funds': ' | '.join(selected),
+                    'Hits': f"{int(row['Hits'])}/{top_n}",
+                    'Port Return': f"{row['Portfolio Return']*100:.1f}%",
+                    'Actual Top Funds': ' | '.join(actual)
+                })
+            
+            summary_df = pd.DataFrame(summary_data)
+            st.dataframe(summary_df, use_container_width=True, height=500)
+
+
 def render_backtest_tab():
-    """Render the Backtester tab with improved UI."""
+    """Render the Backtester tab with improved UI and detailed trade history."""
     
     # Header
     st.markdown("""
     <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); padding: 20px; border-radius: 12px; margin-bottom: 20px;">
         <h2 style="color: white; margin: 0;">🚀 Strategy Backtester</h2>
-        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Test fund selection strategies with historical data</p>
+        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Test fund selection strategies with detailed trade-by-trade analysis</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1247,91 +1673,149 @@ def render_backtest_tab():
         st.error("Could not load data.")
         return
     
-    # Strategy tabs
+    st.success(f"✅ Loaded {len(nav_df.columns)} funds | Data: {nav_df.index.min().strftime('%Y-%m')} to {nav_df.index.max().strftime('%Y-%m')}")
+    
+    # Strategy definitions
     strategies = {
         '🚀 Momentum': ('momentum', {'w_3m': 0.33, 'w_6m': 0.33, 'w_12m': 0.33, 'risk_adjust': True}),
         '⚖️ Sharpe': ('sharpe', {}),
         '🎯 Sortino': ('sortino', {}),
         '🚦 Regime Switch': ('regime_switch', {}),
-        '⚓ Stable Momentum': ('stable_momentum', {})
+        '⚓ Stable Momentum': ('stable_momentum', {}),
+        '🛡️ Elimination': ('elimination', {}),
+        '📈 Consistency': ('consistency', {})
     }
     
     tabs = st.tabs(list(strategies.keys()) + ['📊 Compare All'])
     
+    # Individual strategy tabs
     for idx, (tab_name, (strat_key, mom_config)) in enumerate(strategies.items()):
         with tabs[idx]:
             st.markdown(f"### {tab_name} Strategy")
             
-            with st.spinner("Running backtest..."):
-                history, eq_curve, bench_curve = run_backtest(
-                    nav_df, strat_key, top_n, target_n, holding, {}, mom_config, benchmark
-                )
+            # Strategy description
+            descriptions = {
+                'momentum': "Ranks funds by weighted average of 3M, 6M, 12M returns (risk-adjusted).",
+                'sharpe': "Ranks funds by Sharpe Ratio (excess return / volatility).",
+                'sortino': "Ranks funds by Sortino Ratio (excess return / downside volatility).",
+                'regime_switch': "Uses Momentum in bull markets (price > 200 DMA), Sharpe in bear markets.",
+                'stable_momentum': "Selects top momentum funds, then filters for lowest drawdown.",
+                'elimination': "Eliminates worst 25% by drawdown, worst 25% by volatility, picks top by Sharpe.",
+                'consistency': "Requires fund to be top 50% for 3+ of last 4 quarters, then picks by momentum."
+            }
+            st.info(f"📌 **Logic:** {descriptions.get(strat_key, 'Custom strategy')}")
             
-            if not eq_curve.empty:
-                # Metrics
-                years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
-                strat_cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
-                bench_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
-                avg_hit = history['hit_rate'].mean()
-                
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Strategy CAGR", f"{strat_cagr*100:.2f}%")
-                col2.metric("Benchmark CAGR", f"{bench_cagr*100:.2f}%")
-                col3.metric("Outperformance", f"{(strat_cagr-bench_cagr)*100:.2f}%")
-                col4.metric("Avg Hit Rate", f"{avg_hit*100:.1f}%")
-                
-                # Chart
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=eq_curve['date'], y=eq_curve['value'],
-                                        name='Strategy', line=dict(color='green', width=2)))
-                fig.add_trace(go.Scatter(x=bench_curve['date'], y=bench_curve['value'],
-                                        name='Benchmark', line=dict(color='gray', width=2, dash='dot')))
-                fig.update_layout(height=400, title='Equity Curve')
-                st.plotly_chart(fig, use_container_width=True)
+            display_strategy_results(nav_df, scheme_map, benchmark, strat_key, tab_name, 
+                                    mom_config, top_n, target_n, holding)
     
     # Compare All tab
     with tabs[-1]:
         st.markdown("### 📊 Strategy Comparison")
+        st.markdown("*Compare all strategies side by side*")
         
         results = []
-        fig = go.Figure()
+        all_equity_curves = {}
         
-        for name, (strat_key, mom_config) in strategies.items():
-            history, eq_curve, bench_curve = run_backtest(
-                nav_df, strat_key, top_n, target_n, holding, {}, mom_config, benchmark
+        progress = st.progress(0)
+        for idx, (name, (strat_key, mom_config)) in enumerate(strategies.items()):
+            history, eq_curve, bench_curve, detailed = run_backtest_detailed(
+                nav_df, strat_key, top_n, target_n, holding, {}, mom_config, benchmark, scheme_map
             )
             
             if not eq_curve.empty:
                 years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
                 cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                bench_cagr_val = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
                 hit_rate = history['hit_rate'].mean()
                 max_dd = calculate_max_dd(pd.Series(eq_curve['value'].values, index=eq_curve['date']))
+                
+                # Additional metrics
+                win_rate = (history['return'] > 0).mean()
+                avg_return = history['return'].mean()
                 
                 results.append({
                     'Strategy': name,
                     'CAGR %': cagr * 100,
+                    'Benchmark CAGR %': bench_cagr_val * 100,
+                    'Alpha %': (cagr - bench_cagr_val) * 100,
                     'Max DD %': max_dd * 100 if max_dd else 0,
-                    'Hit Rate %': hit_rate * 100
+                    'Hit Rate %': hit_rate * 100,
+                    'Win Rate %': win_rate * 100,
+                    'Avg Period Return %': avg_return * 100,
+                    'Total Trades': len(history)
                 })
                 
-                fig.add_trace(go.Scatter(x=eq_curve['date'], y=eq_curve['value'], name=name))
+                all_equity_curves[name] = eq_curve
+            
+            progress.progress((idx + 1) / len(strategies))
         
-        fig.add_trace(go.Scatter(x=bench_curve['date'], y=bench_curve['value'],
-                                name='Benchmark', line=dict(color='black', width=2, dash='dot')))
+        progress.empty()
         
+        # Results table
         if results:
             results_df = pd.DataFrame(results).sort_values('CAGR %', ascending=False)
+            
             st.dataframe(
                 results_df.style.format({
-                    'CAGR %': '{:.2f}%',
-                    'Max DD %': '{:.2f}%',
-                    'Hit Rate %': '{:.1f}%'
-                }).background_gradient(subset=['CAGR %'], cmap='Greens'),
+                    'CAGR %': '{:.2f}',
+                    'Benchmark CAGR %': '{:.2f}',
+                    'Alpha %': '{:+.2f}',
+                    'Max DD %': '{:.2f}',
+                    'Hit Rate %': '{:.1f}',
+                    'Win Rate %': '{:.1f}',
+                    'Avg Period Return %': '{:.2f}',
+                    'Total Trades': '{:.0f}'
+                }).background_gradient(subset=['CAGR %', 'Alpha %'], cmap='RdYlGn')
+                .background_gradient(subset=['Hit Rate %'], cmap='Greens'),
                 use_container_width=True
             )
         
-        fig.update_layout(height=450, title='Strategy Comparison')
+        # Comparison chart
+        fig = go.Figure()
+        colors = px.colors.qualitative.Set2
+        
+        for idx, (name, eq_curve) in enumerate(all_equity_curves.items()):
+            fig.add_trace(go.Scatter(
+                x=eq_curve['date'], 
+                y=eq_curve['value'],
+                name=name,
+                line=dict(color=colors[idx % len(colors)], width=2)
+            ))
+        
+        if 'bench_curve' in dir() and not bench_curve.empty:
+            fig.add_trace(go.Scatter(
+                x=bench_curve['date'], 
+                y=bench_curve['value'],
+                name='Benchmark (Nifty 100)', 
+                line=dict(color='black', width=2, dash='dot')
+            ))
+        
+        fig.update_layout(
+            height=500, 
+            title='Strategy Equity Curves Comparison',
+            yaxis_title='Value (100 = Start)',
+            hovermode='x unified',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+        )
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Hit rate comparison chart
+        if results:
+            fig2 = go.Figure(data=[
+                go.Bar(
+                    x=[r['Strategy'] for r in results],
+                    y=[r['Hit Rate %'] for r in results],
+                    marker_color=[colors[i % len(colors)] for i in range(len(results))],
+                    text=[f"{r['Hit Rate %']:.1f}%" for r in results],
+                    textposition='outside'
+                )
+            ])
+            fig2.update_layout(
+                height=350,
+                title='Hit Rate Comparison by Strategy',
+                yaxis_title='Hit Rate %'
+            )
+            st.plotly_chart(fig2, use_container_width=True)
 
 # ============================================================================
 # 10. MAIN APP
