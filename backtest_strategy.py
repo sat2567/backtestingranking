@@ -1029,11 +1029,11 @@ def render_explorer_tab():
         
         with col1:
             fig = create_performance_chart(nav_df, [selected_fund_id], scheme_map, benchmark)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"perf_chart_{selected_fund_id}")
         
         with col2:
             fig = create_drawdown_chart(series, selected_fund_name)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"dd_chart_{selected_fund_id}")
         
         # Rolling return charts
         st.markdown("#### Rolling Return Comparison")
@@ -1041,12 +1041,12 @@ def render_explorer_tab():
         
         with col1:
             fig = create_rolling_return_chart(nav_df, selected_fund_id, scheme_map, benchmark, 252)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"roll1y_chart_{selected_fund_id}")
         
         with col2:
             if len(series) >= 756:
                 fig = create_rolling_return_chart(nav_df, selected_fund_id, scheme_map, benchmark, 756)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"roll3y_chart_{selected_fund_id}")
             else:
                 st.info("Insufficient data for 3Y rolling analysis")
 
@@ -1495,7 +1495,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
             yaxis_title='Value (100 = Start)',
             hovermode='x unified'
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"eq_curve_{key_prefix}")
         
         # Hit rate over time chart
         if not detailed_trades.empty:
@@ -1516,7 +1516,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                 yaxis_title='Hit Rate %',
                 xaxis_title='Period'
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, use_container_width=True, key=f"hit_rate_{key_prefix}")
     
     with sub_tab2:
         st.markdown("### 📋 Complete Trade History")
@@ -1548,12 +1548,12 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
             )
             
             # Download button
-            csv = display_df.to_csv(index=False)
             st.download_button(
                 "📥 Download Trade History (CSV)",
                 csv,
                 f"{strat_key}_trade_history.csv",
-                "text/csv"
+                "text/csv",
+                key=f"download_{key_prefix}"
             )
     
     with sub_tab3:
@@ -1576,7 +1576,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                     title=f'Distribution of Hits per Period (out of {top_n} picks)',
                     height=300
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"hit_dist_{key_prefix}")
                 
                 # Summary stats
                 st.markdown("**Hit Rate Statistics:**")
@@ -1597,7 +1597,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                 if len(miss_periods) > 0:
                     fig.add_trace(go.Box(y=miss_periods * 100, name='Periods with No Hits', marker_color='red'))
                 fig.update_layout(title='Returns Distribution: Hits vs No Hits', yaxis_title='Return %', height=300)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"hit_returns_{key_prefix}")
                 
                 st.markdown("**Return Statistics:**")
                 if len(hit_periods) > 0:
@@ -1797,7 +1797,7 @@ def render_backtest_tab():
             hovermode='x unified',
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="compare_all_eq_curves")
         
         # Hit rate comparison chart
         if results:
@@ -1815,7 +1815,7 @@ def render_backtest_tab():
                 title='Hit Rate Comparison by Strategy',
                 yaxis_title='Hit Rate %'
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, use_container_width=True, key="compare_all_hit_rates")
 
 # ============================================================================
 # 10. MAIN APP
