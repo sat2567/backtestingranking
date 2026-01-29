@@ -1115,8 +1115,8 @@ def render_backtest_tab():
         target_n = st.number_input("🏆 Compare Top", 1, 20, 5, key="bt_target", 
             help="Compare against top N performers from scored pool")
     with col4: 
-        holding = st.selectbox("📅 Hold Period", [63, 126, 252], index=1, 
-            format_func=lambda x: f"{x}d (~{x//21}M)")
+        holding = st.selectbox("📅 Hold Period", [63, 126, 189, 252, 378, 504, 630, 756], index=1, 
+            format_func=lambda x: f"{x}d (~{x//21}M)" if x < 252 else f"{x}d (~{x//252}Y)")
     
     st.divider()
     
