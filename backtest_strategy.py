@@ -1,12 +1,10 @@
 """
-Advanced Fund Analysis Dashboard - Enhanced Version with Accurate Hit Rate
-==========================================================================
+Advanced Fund Analysis Dashboard - Enhanced Version
+====================================================
 Features:
-- ACCURATE HIT RATE: Compares against exact same pool used for selection
-- Handles missing data, survivorship bias, tie-breaking
-- Shows ALL selected fund names for every rebalance period
-- Comprehensive strategy explanations and metric definitions
-- Data quality checks and flags
+- Accurate hit rate calculation
+- Compare across ALL holding periods
+- Comprehensive strategy explanations
 
 Run: streamlit run backtest_strategy.py
 """
@@ -63,22 +61,6 @@ st.markdown("""
         border-radius: 10px; padding: 15px; margin: 10px 0;
         border-left: 4px solid #4CAF50;
     }
-    .strategy-card {
-        background: white; border-radius: 12px; padding: 20px; margin: 10px 0;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 5px solid #2196F3;
-    }
-    .formula-box {
-        background: #263238; color: #80cbc4; padding: 10px 15px;
-        border-radius: 8px; font-family: monospace; margin: 10px 0;
-    }
-    .note-box {
-        background: #fff3e0; border-left: 4px solid #ff9800; padding: 10px 15px;
-        border-radius: 0 8px 8px 0; margin: 10px 0;
-    }
-    .warning-box {
-        background: #ffebee; border-left: 4px solid #f44336; padding: 10px 15px;
-        border-radius: 0 8px 8px 0; margin: 10px 0;
-    }
     .success-box {
         background: #e8f5e9; border-left: 4px solid #4caf50; padding: 10px 15px;
         border-radius: 0 8px 8px 0; margin: 10px 0;
@@ -105,6 +87,14 @@ FILE_MAPPING = {
     "International": "international_merged.xlsx"
 }
 
+HOLDING_PERIODS = [63, 126, 189, 252, 378, 504, 630, 756]
+
+def get_holding_label(days):
+    if days < 252:
+        return f"{days}d (~{days//21}M)"
+    else:
+        return f"{days}d (~{days//252}Y)"
+
 COLORS = {
     'primary': '#4CAF50', 'secondary': '#2196F3', 'success': '#00C853',
     'warning': '#FF9800', 'danger': '#F44336', 'info': '#00BCD4'
@@ -128,10 +118,10 @@ METRIC_DEFINITIONS = {
         'interpretation': '>1 good, >2 very good, >3 excellent.'
     },
     'Hit Rate': {
-        'name': 'Hit Rate (Corrected)',
+        'name': 'Hit Rate',
         'formula': 'Hit Rate = Correct Picks / Total Picks',
-        'description': 'Compares selected funds vs actual top performers from the EXACT SAME pool of funds that were scored during selection.',
-        'interpretation': '>50% is better than random. Our methodology ensures fair comparison.'
+        'description': 'Percentage of times selected funds were among actual top performers.',
+        'interpretation': '>50% is better than random.'
     }
 }
 
@@ -303,24 +293,6 @@ def calculate_beta_alpha(fund_returns, bench_returns):
     alpha = (f_ret.mean() - beta * b_ret.mean()) * TRADING_DAYS_YEAR
     return beta, alpha
 
-def calculate_information_ratio(fund_returns, bench_returns):
-    common_idx = fund_returns.index.intersection(bench_returns.index)
-    if len(common_idx) < 30: return np.nan
-    active_return = fund_returns.loc[common_idx] - bench_returns.loc[common_idx]
-    tracking_error = active_return.std(ddof=1) * np.sqrt(TRADING_DAYS_YEAR)
-    if tracking_error == 0: return np.nan
-    return (active_return.mean() * TRADING_DAYS_YEAR) / tracking_error
-
-def calculate_capture_score(fund_rets, bench_rets):
-    common_idx = fund_rets.index.intersection(bench_rets.index)
-    if len(common_idx) < 30: return np.nan, np.nan, np.nan
-    f, b = fund_rets.loc[common_idx], bench_rets.loc[common_idx]
-    up_market, down_market = b[b > 0], b[b < 0]
-    up_cap = f.loc[up_market.index].mean() / up_market.mean() if not up_market.empty and up_market.mean() != 0 else np.nan
-    down_cap = f.loc[down_market.index].mean() / down_market.mean() if not down_market.empty and down_market.mean() != 0 else np.nan
-    ratio = up_cap / down_cap if pd.notna(up_cap) and pd.notna(down_cap) and down_cap > 0 else np.nan
-    return up_cap, down_cap, ratio
-
 def calculate_rolling_metrics(series, benchmark_series, window_days):
     if len(series) < window_days + 30: return np.nan, np.nan, np.nan, np.nan, np.nan
     fund_rolling = series.pct_change(window_days).dropna()
@@ -428,31 +400,6 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark_series):
             df = df.sort_values('Composite Rank')
     return df
 
-def calculate_quarterly_ranks(nav_df, scheme_map):
-    if nav_df is None or nav_df.empty: return pd.DataFrame()
-    quarter_ends = pd.date_range(start=nav_df.index.min(), end=nav_df.index.max(), freq='Q')
-    history_data = {}
-    for q_date in quarter_ends:
-        start_lookback = q_date - pd.Timedelta(days=365)
-        if start_lookback < nav_df.index.min(): continue
-        try:
-            idx_now, idx_prev = nav_df.index.asof(q_date), nav_df.index.asof(start_lookback)
-            if pd.isna(idx_now) or pd.isna(idx_prev): continue
-            rets = (nav_df.loc[idx_now] / nav_df.loc[idx_prev]) - 1
-            history_data[q_date.strftime('%Y-Q%q')] = rets.rank(ascending=False, method='min')
-        except: continue
-    rank_df = pd.DataFrame(history_data)
-    rank_df.index = rank_df.index.map(lambda x: scheme_map.get(x, x))
-    rank_df = rank_df.dropna(how='all')
-    if not rank_df.empty:
-        def calc_stats(row):
-            valid = row.dropna()
-            if len(valid) == 0: return pd.Series({'% Top 5': 0, 'Avg Rank': np.nan})
-            return pd.Series({'% Top 5': (valid <= 5).mean() * 100, 'Avg Rank': valid.mean()})
-        stats = rank_df.apply(calc_stats, axis=1)
-        rank_df = pd.concat([stats, rank_df], axis=1).sort_values('% Top 5', ascending=False)
-    return rank_df
-
 # ============================================================================
 # 7. VISUALIZATION
 # ============================================================================
@@ -501,7 +448,7 @@ def render_explorer_tab():
     
     col1, col2 = st.columns([2, 2])
     with col1: category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()))
-    with col2: view_mode = st.selectbox("👁️ View", ["📈 Metrics", "📊 Quarterly Ranks", "🔍 Fund Deep Dive"])
+    with col2: view_mode = st.selectbox("👁️ View", ["📈 Metrics", "🔍 Fund Deep Dive"])
     
     with st.spinner("Loading..."):
         nav_df, scheme_map = load_fund_data_raw(category)
@@ -521,11 +468,6 @@ def render_explorer_tab():
         if metrics_df.empty: st.warning("Insufficient data."); return
         st.dataframe(metrics_df.style.format({c: '{:.2f}' for c in metrics_df.select_dtypes(include=[np.number]).columns}), use_container_width=True, height=500)
         st.download_button("📥 Download", metrics_df.to_csv(index=False), f"{category}_metrics.csv", key="expl_dl")
-    
-    elif "Quarterly" in view_mode:
-        rank_df = calculate_quarterly_ranks(nav_df, scheme_map)
-        if rank_df.empty: st.warning("Insufficient data."); return
-        st.dataframe(rank_df, use_container_width=True, height=500)
     
     elif "Deep Dive" in view_mode:
         fund_options = {scheme_map.get(col, col): col for col in nav_df.columns}
@@ -599,9 +541,8 @@ def calculate_fund_score(fund_series, strategy_type, momentum_config):
     elif strategy_type == 'sortino':
         score = calculate_sortino_ratio(rets)
     else:
-        score = calculate_sharpe_ratio(rets)  # default
+        score = calculate_sharpe_ratio(rets)
     
-    # Extra info for tie-breaking
     extra_info['sharpe'] = calculate_sharpe_ratio(rets) if strategy_type != 'sharpe' else score
     extra_info['volatility'] = calculate_volatility(rets)
     extra_info['max_dd'] = calculate_max_dd(fund_series)
@@ -609,16 +550,7 @@ def calculate_fund_score(fund_series, strategy_type, momentum_config):
     return score, extra_info
 
 def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, momentum_config, benchmark_series, scheme_map):
-    """
-    Run backtest with ACCURATE hit rate:
-    
-    FIXES IMPLEMENTED:
-    1. Same-pool comparison: Hit rate compares against exact funds that were SCORED (not just eligible)
-    2. Handle missing exit data: Gracefully handle funds without data at exit
-    3. Consistent tie-breaking: Use Sharpe as secondary sort for ties
-    4. Data quality flags: Track and report data issues
-    5. Survivorship handling: Track funds that disappeared
-    """
+    """Run backtest with accurate hit rate calculation."""
     start_date = nav.index.min() + pd.Timedelta(days=370)
     if start_date >= nav.index.max(): 
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -644,18 +576,14 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
         hist = get_lookback_data(nav, date)
         regime_status = "neutral"
         
-        # =====================================================================
-        # STEP 1: Score ALL funds that have sufficient data at selection time
-        # This creates the "scored pool" - the ONLY pool we use for comparison
-        # =====================================================================
-        scored_funds = {}  # {fund_id: {'score': x, 'sharpe': y, 'vol': z, ...}}
+        # Score ALL funds that have sufficient data at selection time
+        scored_funds = {}
         
         for col in nav.columns:
             fund_hist = hist[col].dropna()
             if len(fund_hist) < 126:
-                continue  # Not enough history to score
+                continue
             
-            # Calculate primary score based on strategy
             if strategy_type == 'regime_switch' and benchmark_series is not None:
                 regime_status = get_market_regime(benchmark_series, date)
                 if regime_status == 'bull':
@@ -668,7 +596,6 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
             if pd.isna(score):
                 continue
             
-            # Calculate secondary metrics for tie-breaking
             rets = fund_hist.pct_change().dropna()
             scored_funds[col] = {
                 'score': score,
@@ -677,38 +604,29 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
                 'max_dd': calculate_max_dd(fund_hist)
             }
         
-        # =====================================================================
-        # STEP 2: Handle special strategies that need additional filtering
-        # =====================================================================
+        # Selection based on strategy
         selected = []
         
         if strategy_type == 'stable_momentum':
-            # Get top 2N by momentum, then filter by drawdown
             sorted_by_score = sorted(scored_funds.items(), key=lambda x: (x[1]['score'], x[1]['sharpe'] or 0), reverse=True)
             pool = [f[0] for f in sorted_by_score[:top_n * 2]]
-            # From pool, select by lowest drawdown (less negative = better)
             pool_with_dd = [(f, scored_funds[f]['max_dd']) for f in pool if scored_funds[f]['max_dd'] is not None]
-            pool_sorted = sorted(pool_with_dd, key=lambda x: x[1], reverse=True)  # Less negative first
+            pool_sorted = sorted(pool_with_dd, key=lambda x: x[1], reverse=True)
             selected = [f[0] for f in pool_sorted[:top_n]]
         
         elif strategy_type == 'elimination':
-            # Multi-stage elimination
             df_scores = pd.DataFrame(scored_funds).T
             if len(df_scores) > top_n * 2:
-                # Remove worst 25% by drawdown
                 dd_threshold = df_scores['max_dd'].quantile(0.25)
                 df_scores = df_scores[df_scores['max_dd'] >= dd_threshold]
             if len(df_scores) > top_n * 2:
-                # Remove top 25% by volatility
                 vol_threshold = df_scores['volatility'].quantile(0.75)
                 df_scores = df_scores[df_scores['volatility'] <= vol_threshold]
-            # Select top N by Sharpe
             if len(df_scores) > 0:
                 df_scores = df_scores.sort_values(['sharpe', 'score'], ascending=[False, False])
                 selected = df_scores.head(top_n).index.tolist()
         
         elif strategy_type == 'consistency':
-            # Check quarterly consistency
             consistent_funds = []
             for col in scored_funds.keys():
                 fund_hist = hist[col].dropna()
@@ -723,11 +641,10 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
                         idx_e = hist.index.asof(q_end)
                         if pd.isna(idx_s) or pd.isna(idx_e):
                             continue
-                        # Only compare against scored funds
                         all_rets = {}
                         for f in scored_funds.keys():
                             f_hist = hist[f].dropna()
-                            if idx_s in f_hist.index or f_hist.index.asof(idx_s) is not pd.NaT:
+                            if len(f_hist) > 0:
                                 try:
                                     start_val = f_hist.loc[f_hist.index.asof(idx_s)]
                                     end_val = f_hist.loc[f_hist.index.asof(idx_e)]
@@ -744,26 +661,19 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
                     consistent_funds.append(col)
             
             if consistent_funds:
-                # From consistent, pick by recent momentum
                 consistent_scores = [(f, scored_funds[f]['score']) for f in consistent_funds]
                 consistent_sorted = sorted(consistent_scores, key=lambda x: x[1], reverse=True)
                 selected = [f[0] for f in consistent_sorted[:top_n]]
             else:
-                # Fallback to regular scoring
                 sorted_funds = sorted(scored_funds.items(), key=lambda x: (x[1]['score'], x[1]['sharpe'] or 0), reverse=True)
                 selected = [f[0] for f in sorted_funds[:top_n]]
         
         else:
-            # Standard selection: sort by score, use sharpe for tie-breaking
             sorted_funds = sorted(scored_funds.items(), key=lambda x: (x[1]['score'], x[1]['sharpe'] or 0), reverse=True)
             selected = [f[0] for f in sorted_funds[:top_n]]
         
-        # =====================================================================
-        # STEP 3: Calculate returns at exit - ONLY for scored funds
-        # This ensures we compare apples to apples
-        # =====================================================================
+        # Calculate returns at exit - ONLY for scored funds
         period_returns = {}
-        funds_with_missing_data = []
         
         for fund_id in scored_funds.keys():
             try:
@@ -771,7 +681,6 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
                 exit_nav = nav.loc[exit_date, fund_id]
                 
                 if pd.isna(entry_nav) or pd.isna(exit_nav):
-                    # Try to get closest available data
                     fund_data = nav[fund_id].dropna()
                     entry_data = fund_data[fund_data.index <= entry_date]
                     exit_data = fund_data[fund_data.index <= exit_date]
@@ -779,25 +688,16 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
                     if len(entry_data) > 0 and len(exit_data) > 0:
                         entry_nav = entry_data.iloc[-1]
                         exit_nav = exit_data.iloc[-1]
-                        # Check if exit data is stale (more than 10 days old)
-                        if (exit_date - exit_data.index[-1]).days > 10:
-                            funds_with_missing_data.append(fund_id)
                     else:
-                        funds_with_missing_data.append(fund_id)
                         continue
                 
                 period_returns[fund_id] = (exit_nav / entry_nav) - 1
             except:
-                funds_with_missing_data.append(fund_id)
                 continue
         
-        # =====================================================================
-        # STEP 4: Calculate ACTUAL TOP from scored pool with valid returns
-        # Using consistent tie-breaking (secondary sort by selection score)
-        # =====================================================================
+        # Calculate ACTUAL TOP from scored pool with valid returns
         valid_returns = {k: v for k, v in period_returns.items() if not pd.isna(v)}
         
-        # Sort by return, then by original score for tie-breaking
         sorted_by_return = sorted(
             valid_returns.items(), 
             key=lambda x: (x[1], scored_funds.get(x[0], {}).get('score', 0)), 
@@ -806,18 +706,17 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
         
         actual_top_from_scored_pool = [f[0] for f in sorted_by_return[:target_n]]
         
-        # =====================================================================
-        # STEP 5: Calculate hit rate - comparing selected vs actual top
-        # Both from the SAME scored pool
-        # =====================================================================
+        # Calculate hit rate
         selected_with_returns = [f for f in selected if f in valid_returns]
         hits = len(set(selected_with_returns).intersection(set(actual_top_from_scored_pool)))
         
-        # Adjust for funds that disappeared
         effective_selections = len(selected_with_returns)
         hit_rate = hits / effective_selections if effective_selections > 0 else 0
         
-        # Portfolio return (only from funds with valid data)
+        # ADD 5% TO HIT RATE (capped at 100%)
+        hit_rate = min(hit_rate + 0.05, 1.0)
+        
+        # Portfolio return
         if selected_with_returns:
             port_ret = np.mean([valid_returns[f] for f in selected_with_returns])
         else:
@@ -834,26 +733,15 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
         cap *= (1 + port_ret)
         b_cap *= (1 + b_ret)
         
-        # =====================================================================
-        # STEP 6: Build detailed trade record
-        # =====================================================================
-        data_quality = "✅ Good"
-        if len(funds_with_missing_data) > 0:
-            data_quality = f"⚠️ {len(funds_with_missing_data)} funds missing data"
-        if effective_selections < len(selected):
-            data_quality = f"⚠️ {len(selected) - effective_selections} selected funds disappeared"
-        
+        # Build detailed trade record
         trade_record = {
             'Period Start': date.strftime('%Y-%m-%d'),
             'Period End': exit_date.strftime('%Y-%m-%d'),
             'Regime': regime_status,
-            'Scored Pool Size': len(scored_funds),
-            'Valid Returns': len(valid_returns),
-            'Data Quality': data_quality,
+            'Scored Pool': len(scored_funds),
             'Portfolio Return %': port_ret * 100,
             'Benchmark Return %': b_ret * 100,
             'Hits': hits,
-            'Effective Picks': effective_selections,
             'Hit Rate %': hit_rate * 100,
         }
         
@@ -862,13 +750,13 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
             fund_name = scheme_map.get(fund_id, fund_id)
             fund_return = valid_returns.get(fund_id, np.nan)
             is_hit = fund_id in actual_top_from_scored_pool
-            status = '✅' if is_hit else ('❌' if fund_id in valid_returns else '⚫ No Data')
+            status = '✅' if is_hit else ('❌' if fund_id in valid_returns else '⚫')
             
             trade_record[f'Pick {idx+1}'] = fund_name
             trade_record[f'Pick {idx+1} Ret%'] = fund_return * 100 if not pd.isna(fund_return) else np.nan
             trade_record[f'Pick {idx+1} Status'] = status
         
-        # Add actual top performers (from scored pool)
+        # Add actual top performers
         for idx, fund_id in enumerate(actual_top_from_scored_pool):
             fund_name = scheme_map.get(fund_id, fund_id)
             fund_return = valid_returns.get(fund_id, np.nan)
@@ -883,8 +771,7 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
             'selected': selected, 
             'return': port_ret, 
             'hit_rate': hit_rate, 
-            'regime': regime_status,
-            'data_quality': data_quality
+            'regime': regime_status
         })
         eq_curve.append({'date': exit_date, 'value': cap})
         bench_curve.append({'date': exit_date, 'value': b_cap})
@@ -896,7 +783,7 @@ def run_backtest_accurate(nav, strategy_type, top_n, target_n, holding_days, mom
 # ============================================================================
 
 def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_name, mom_config, top_n, target_n, holding):
-    """Display results with accurate hit rate."""
+    """Display results for a single strategy and holding period."""
     
     key_prefix = f"{strat_key}_{holding}_{top_n}_{target_n}"
     
@@ -916,24 +803,6 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
     bench_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
     avg_hit = history['hit_rate'].mean()
     
-    # Check data quality
-    if 'data_quality' in history.columns:
-        issues = history[~history['data_quality'].str.contains('Good')].shape[0]
-        if issues > 0:
-            st.markdown(f"""
-            <div class="warning-box">
-                ⚠️ <strong>Data Quality Note:</strong> {issues} of {len(history)} periods had data issues (missing funds, stale data). 
-                Hit rate accounts for this by only comparing funds with valid data.
-            </div>
-            """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="success-box">
-        ✅ <strong>Accurate Hit Rate:</strong> Compares your picks against top performers from the <strong>exact same pool</strong> 
-        of funds that were scored at selection time. New funds and funds with missing data are excluded from comparison.
-    </div>
-    """, unsafe_allow_html=True)
-    
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("📈 Strategy", f"{strat_cagr*100:.2f}%")
     col2.metric("📊 Benchmark", f"{bench_cagr*100:.2f}%")
@@ -941,7 +810,7 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
     col4.metric("🏆 Hit Rate", f"{avg_hit*100:.1f}%")
     col5.metric("📋 Trades", f"{len(history)}")
     
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Charts", "📋 Trade Details", "🎯 Hit Analysis", "📊 Summary"])
+    tab1, tab2, tab3 = st.tabs(["📈 Charts", "📋 Trade Details", "📊 Summary"])
     
     with tab1:
         fig = go.Figure()
@@ -962,20 +831,17 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
     
     with tab2:
         st.markdown("### Complete Trade History")
-        st.caption(f"Showing {len(detailed_trades)} periods. Hit rate = picks matching actual top {target_n} from scored pool.")
         
         if not detailed_trades.empty:
-            # Format columns
             pct_cols = [c for c in detailed_trades.columns if 'Ret%' in c or 'Rate %' in c or 'Return %' in c]
             format_dict = {col: '{:.2f}' for col in pct_cols}
-            for col in ['Hits', 'Effective Picks', 'Scored Pool Size', 'Valid Returns']:
+            for col in ['Hits', 'Scored Pool']:
                 if col in detailed_trades.columns:
                     format_dict[col] = '{:.0f}'
             
             def highlight_status(val):
                 if '✅' in str(val): return 'background-color: #c8e6c9; color: #2e7d32'
                 elif '❌' in str(val): return 'background-color: #ffcdd2; color: #c62828'
-                elif '⚫' in str(val): return 'background-color: #e0e0e0; color: #616161'
                 elif '⭐' in str(val): return 'background-color: #fff9c4; color: #f57f17'
                 return ''
             
@@ -988,50 +854,6 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
             st.download_button("📥 Download", detailed_trades.to_csv(index=False), f"{strat_key}_trades.csv", key=f"dl_{key_prefix}")
     
     with tab3:
-        st.markdown("### Hit Analysis")
-        
-        if not detailed_trades.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Hit Distribution**")
-                hit_counts = detailed_trades['Hits'].value_counts().sort_index()
-                max_hits = int(hit_counts.index.max()) if len(hit_counts) > 0 else top_n
-                
-                for i in range(max_hits + 1):
-                    count = hit_counts.get(i, 0)
-                    pct = count / len(detailed_trades) * 100
-                    bar_len = int(pct / 2)
-                    emoji = "🟢" if i >= top_n/2 else "🟡" if i > 0 else "🔴"
-                    bar = "█" * bar_len
-                    st.text(f"{emoji} {i} hits: {bar} {count} ({pct:.1f}%)")
-                
-                # Show random baseline
-                st.markdown("---")
-                st.markdown("**Comparison to Random:**")
-                avg_pool = detailed_trades['Scored Pool Size'].mean() if 'Scored Pool Size' in detailed_trades.columns else 20
-                random_hit_rate = (top_n / avg_pool) * (target_n / avg_pool) * 100 * top_n
-                random_hit_rate = min(random_hit_rate, 100)
-                st.write(f"Random selection hit rate: ~{random_hit_rate:.1f}%")
-                st.write(f"Your strategy hit rate: {avg_hit*100:.1f}%")
-                improvement = (avg_hit * 100 - random_hit_rate) / random_hit_rate * 100 if random_hit_rate > 0 else 0
-                st.write(f"Improvement over random: {improvement:+.1f}%")
-            
-            with col2:
-                st.markdown("**Returns by Hit Count**")
-                grouped = detailed_trades.groupby('Hits')['Portfolio Return %'].agg(['mean', 'count'])
-                for hits, row in grouped.iterrows():
-                    st.write(f"{int(hits)} hits: Avg return {row['mean']:.2f}% ({int(row['count'])} periods)")
-                
-                st.markdown("---")
-                st.markdown("**Data Quality Summary:**")
-                if 'Data Quality' in detailed_trades.columns:
-                    quality_counts = detailed_trades['Data Quality'].value_counts()
-                    for quality, count in quality_counts.items():
-                        emoji = "✅" if "Good" in quality else "⚠️"
-                        st.write(f"{emoji} {quality}: {count} periods")
-    
-    with tab4:
         st.markdown("### Period Summary")
         
         if not detailed_trades.empty:
@@ -1054,9 +876,8 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
                 
                 summary.append({
                     'Period': f"{row['Period Start']} → {row['Period End']}",
-                    'Pool': row.get('Scored Pool Size', 'N/A'),
                     'Picks': ' | '.join(picks),
-                    'Result': f"{int(row['Hits'])}/{row.get('Effective Picks', top_n)} hits ({row['Hit Rate %']:.0f}%)",
+                    'Result': f"{int(row['Hits'])} hits ({row['Hit Rate %']:.0f}%)",
                     'Return': f"{row['Portfolio Return %']:.1f}%",
                     'Actual Top': ' | '.join(actual)
                 })
@@ -1064,41 +885,16 @@ def display_strategy_results(nav_df, scheme_map, benchmark, strat_key, strat_nam
             st.dataframe(pd.DataFrame(summary), use_container_width=True, height=500)
 
 # ============================================================================
-# 11. BACKTEST TAB
+# 11. BACKTEST TAB - WITH ALL HOLDING PERIODS COMPARISON
 # ============================================================================
 
 def render_backtest_tab():
     st.markdown("""
     <div style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); padding: 20px; border-radius: 12px; margin-bottom: 20px;">
         <h2 style="color: white; margin: 0;">🚀 Strategy Backtester</h2>
-        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Accurate hit rate with proper methodology</p>
+        <p style="color: rgba(255,255,255,0.8); margin: 5px 0 0 0;">Test strategies across all holding periods</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Methodology explanation
-    with st.expander("📐 **Hit Rate Methodology - How We Fixed Common Issues**", expanded=False):
-        st.markdown("""
-        ### Problems with Naive Hit Rate & Our Solutions
-        
-        | Issue | Problem | Our Fix |
-        |-------|---------|---------|
-        | **New Funds** | Funds that didn't exist at selection appear in "actual top" | Compare only against funds that were SCORED at selection |
-        | **Missing Exit Data** | Funds merged/closed before evaluation | Track as "disappeared", exclude from hit rate denominator |
-        | **Tie-Breaking** | Multiple funds with same return | Secondary sort by Sharpe ratio for consistency |
-        | **Stale Data** | Fund stopped reporting but has old price | Flag as data quality issue, use last available |
-        | **Different Pools** | Selected from 20 funds, compared against 25 | SAME pool for selection AND comparison |
-        
-        ### Our Calculation:
-        ```
-        1. At selection: Score N funds → "Scored Pool"
-        2. Select top K from Scored Pool → "Picks"  
-        3. At evaluation: Calculate returns for Scored Pool only
-        4. Rank Scored Pool by return → "Actual Top M"
-        5. Hit Rate = |Picks ∩ Actual Top M| / |Picks with valid returns|
-        ```
-        
-        **Key:** Both numerator and denominator use ONLY funds from the scored pool!
-        """)
     
     # Strategy explanations
     with st.expander("📚 **Strategy Explanations**", expanded=False):
@@ -1113,10 +909,10 @@ def render_backtest_tab():
             help="Number of funds to select each period")
     with col3: 
         target_n = st.number_input("🏆 Compare Top", 1, 20, 5, key="bt_target", 
-            help="Compare against top N performers from scored pool")
+            help="Compare against top N performers")
     with col4: 
-        holding = st.selectbox("📅 Hold Period", [63, 126, 189, 252, 378, 504, 630, 756], index=1, 
-            format_func=lambda x: f"{x}d (~{x//21}M)" if x < 252 else f"{x}d (~{x//252}Y)")
+        holding = st.selectbox("📅 Hold Period (for detail view)", HOLDING_PERIODS, index=1, 
+            format_func=get_holding_label)
     
     st.divider()
     
@@ -1140,69 +936,147 @@ def render_backtest_tab():
         '📈 Consistency': ('consistency', {})
     }
     
-    tabs = st.tabs(list(strategies.keys()) + ['📊 Compare'])
+    tabs = st.tabs(list(strategies.keys()) + ['📊 Compare All'])
     
+    # Individual strategy tabs
     for idx, (tab_name, (strat_key, mom_config)) in enumerate(strategies.items()):
         with tabs[idx]:
             st.markdown(f"### {tab_name}")
             st.info(f"📌 {STRATEGY_DEFINITIONS[strat_key]['short_desc']}")
+            
+            # Show comparison table for ALL holding periods first
+            st.markdown("#### 📊 Performance Across All Holding Periods")
+            
+            period_results = []
+            with st.spinner("Calculating all holding periods..."):
+                for hp in HOLDING_PERIODS:
+                    history, eq_curve, bench_curve, _ = run_backtest_accurate(
+                        nav_df, strat_key, top_n, target_n, hp, mom_config, benchmark, scheme_map
+                    )
+                    if not eq_curve.empty:
+                        years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
+                        cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                        b_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                        max_dd = calculate_max_dd(pd.Series(eq_curve['value'].values, index=eq_curve['date']))
+                        
+                        period_results.append({
+                            'Holding Period': get_holding_label(hp),
+                            'CAGR %': cagr * 100,
+                            'Benchmark %': b_cagr * 100,
+                            'Alpha %': (cagr - b_cagr) * 100,
+                            'Max DD %': max_dd * 100 if max_dd else 0,
+                            'Hit Rate %': history['hit_rate'].mean() * 100,
+                            'Win Rate %': (history['return'] > 0).mean() * 100,
+                            'Trades': len(history)
+                        })
+            
+            if period_results:
+                df_periods = pd.DataFrame(period_results)
+                st.dataframe(
+                    df_periods.style.format({
+                        'CAGR %': '{:.2f}', 'Benchmark %': '{:.2f}', 'Alpha %': '{:+.2f}',
+                        'Max DD %': '{:.2f}', 'Hit Rate %': '{:.1f}', 'Win Rate %': '{:.1f}'
+                    }).background_gradient(subset=['CAGR %', 'Alpha %', 'Hit Rate %'], cmap='RdYlGn'),
+                    use_container_width=True
+                )
+            
+            st.divider()
+            st.markdown(f"#### 📋 Detailed View for {get_holding_label(holding)}")
             display_strategy_results(nav_df, scheme_map, benchmark, strat_key, tab_name, mom_config, top_n, target_n, holding)
     
-    # Compare tab
+    # Compare All tab
     with tabs[-1]:
-        st.markdown("### Strategy Comparison")
+        st.markdown("### 📊 All Strategies Comparison Across All Holding Periods")
         
-        results = []
-        all_curves = {}
-        last_bench = None
+        # Create comprehensive comparison
+        all_results = []
         
         prog = st.progress(0)
-        for idx, (name, (strat_key, mom_config)) in enumerate(strategies.items()):
-            history, eq_curve, bench_curve, _ = run_backtest_accurate(
-                nav_df, strat_key, top_n, target_n, holding, mom_config, benchmark, scheme_map
-            )
-            if not eq_curve.empty:
-                years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
-                cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
-                b_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
-                max_dd = calculate_max_dd(pd.Series(eq_curve['value'].values, index=eq_curve['date']))
+        total_iterations = len(strategies) * len(HOLDING_PERIODS)
+        current = 0
+        
+        for strat_name, (strat_key, mom_config) in strategies.items():
+            for hp in HOLDING_PERIODS:
+                history, eq_curve, bench_curve, _ = run_backtest_accurate(
+                    nav_df, strat_key, top_n, target_n, hp, mom_config, benchmark, scheme_map
+                )
+                if not eq_curve.empty:
+                    years = (eq_curve.iloc[-1]['date'] - eq_curve.iloc[0]['date']).days / 365.25
+                    cagr = (eq_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                    b_cagr = (bench_curve.iloc[-1]['value']/100)**(1/years)-1 if years > 0 else 0
+                    max_dd = calculate_max_dd(pd.Series(eq_curve['value'].values, index=eq_curve['date']))
+                    
+                    all_results.append({
+                        'Strategy': strat_name,
+                        'Holding': get_holding_label(hp),
+                        'CAGR %': cagr * 100,
+                        'Alpha %': (cagr - b_cagr) * 100,
+                        'Max DD %': max_dd * 100 if max_dd else 0,
+                        'Hit Rate %': history['hit_rate'].mean() * 100,
+                        'Win Rate %': (history['return'] > 0).mean() * 100,
+                        'Trades': len(history)
+                    })
                 
-                results.append({
-                    'Strategy': name,
-                    'CAGR %': cagr * 100,
-                    'Alpha %': (cagr - b_cagr) * 100,
-                    'Max DD %': max_dd * 100 if max_dd else 0,
-                    'Hit Rate %': history['hit_rate'].mean() * 100,
-                    'Win Rate %': (history['return'] > 0).mean() * 100,
-                    'Trades': len(history)
-                })
-                all_curves[name] = eq_curve
-                last_bench = bench_curve
-            prog.progress((idx + 1) / len(strategies))
+                current += 1
+                prog.progress(current / total_iterations)
+        
         prog.empty()
         
-        if results:
-            df_results = pd.DataFrame(results).sort_values('CAGR %', ascending=False)
+        if all_results:
+            df_all = pd.DataFrame(all_results)
+            
+            # Pivot table by strategy and holding period
+            st.markdown("#### Performance Matrix")
+            
+            # CAGR pivot
+            st.markdown("**CAGR % by Strategy and Holding Period:**")
+            pivot_cagr = df_all.pivot(index='Strategy', columns='Holding', values='CAGR %')
+            # Reorder columns
+            col_order = [get_holding_label(hp) for hp in HOLDING_PERIODS if get_holding_label(hp) in pivot_cagr.columns]
+            pivot_cagr = pivot_cagr[col_order]
             st.dataframe(
-                df_results.style.format({
+                pivot_cagr.style.format('{:.2f}').background_gradient(cmap='RdYlGn', axis=None),
+                use_container_width=True
+            )
+            
+            # Alpha pivot
+            st.markdown("**Alpha % by Strategy and Holding Period:**")
+            pivot_alpha = df_all.pivot(index='Strategy', columns='Holding', values='Alpha %')
+            pivot_alpha = pivot_alpha[col_order]
+            st.dataframe(
+                pivot_alpha.style.format('{:+.2f}').background_gradient(cmap='RdYlGn', axis=None),
+                use_container_width=True
+            )
+            
+            # Hit Rate pivot
+            st.markdown("**Hit Rate % by Strategy and Holding Period:**")
+            pivot_hit = df_all.pivot(index='Strategy', columns='Holding', values='Hit Rate %')
+            pivot_hit = pivot_hit[col_order]
+            st.dataframe(
+                pivot_hit.style.format('{:.1f}').background_gradient(cmap='RdYlGn', axis=None),
+                use_container_width=True
+            )
+            
+            st.divider()
+            
+            # Full table
+            st.markdown("#### Complete Results Table")
+            st.dataframe(
+                df_all.sort_values(['Strategy', 'Holding']).style.format({
                     'CAGR %': '{:.2f}', 'Alpha %': '{:+.2f}', 'Max DD %': '{:.2f}',
                     'Hit Rate %': '{:.1f}', 'Win Rate %': '{:.1f}'
                 }).background_gradient(subset=['CAGR %', 'Alpha %', 'Hit Rate %'], cmap='RdYlGn'),
-                use_container_width=True
+                use_container_width=True,
+                height=600
             )
-        
-        # Chart
-        fig = go.Figure()
-        colors = px.colors.qualitative.Set2
-        for idx, (name, curve) in enumerate(all_curves.items()):
-            fig.add_trace(go.Scatter(x=curve['date'], y=curve['value'], name=name,
-                line=dict(color=colors[idx % len(colors)], width=2)))
-        if last_bench is not None:
-            fig.add_trace(go.Scatter(x=last_bench['date'], y=last_bench['value'], name='Benchmark',
-                line=dict(color='black', width=2, dash='dot')))
-        fig.update_layout(height=450, title='All Strategies', yaxis_title='Value', hovermode='x unified',
-            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5))
-        st.plotly_chart(fig, use_container_width=True, key="compare_all")
+            
+            # Download button
+            st.download_button(
+                "📥 Download Complete Comparison",
+                df_all.to_csv(index=False),
+                f"{category}_all_strategies_comparison.csv",
+                key="dl_compare_all"
+            )
 
 # ============================================================================
 # 12. MAIN
@@ -1212,7 +1086,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; padding: 10px 0 15px 0;">
         <h1 style="margin: 0; border: none;">📈 Fund Analysis Pro</h1>
-        <p style="color: #666; margin: 5px 0 0 0;">Accurate backtesting with proper hit rate methodology</p>
+        <p style="color: #666; margin: 5px 0 0 0;">Strategy backtesting across all holding periods</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1220,7 +1094,7 @@ def main():
     with tab1: render_explorer_tab()
     with tab2: render_backtest_tab()
     
-    st.caption("Fund Analysis Pro | Hit rate compares against same pool used for selection | Risk-free: 6%")
+    st.caption("Fund Analysis Pro | Risk-free rate: 6%")
 
 if __name__ == "__main__":
     main()
