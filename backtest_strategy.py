@@ -96,60 +96,95 @@ METRIC_DEFINITIONS = {
 
 STRATEGY_DEFINITIONS = {
     'momentum': {
-        'name': '🚀 Momentum Strategy',
-        'short_desc': 'Selects funds with highest weighted average of 3M, 6M, 12M returns.',
-        'how_it_works': ['Calculate 3M, 6M, 12M returns', 'Apply weights (default 33% each)', 'Optionally divide by volatility', 'Select top N funds'],
-        'formula': 'Score = w1×R3M + w2×R6M + w3×R12M',
-        'best_for': 'Trending markets',
-        'weaknesses': ['Poor at turning points', 'High turnover']
+        'name': '🚀 Composite Momentum',
+        'short_desc': 'Captures structural trends by weighting short, medium, and long-term returns.',
+        'how_it_works': [
+            'Calculate returns for 3-Month, 6-Month, and 12-Month lookback periods.',
+            'Apply equal weights (33% each) to create a "Composite Momentum Score".',
+            'Normalize score by volatility (optional) to penalize erratic movement.',
+            'Select top N funds with the highest risk-adjusted momentum.'
+        ],
+        'formula': 'Score = (0.33 × R_3m) + (0.33 × R_6m) + (0.33 × R_12m)',
+        'best_for': 'Strong trending markets (Bull runs) & Recovery phases.',
+        'weaknesses': ['Suffers heavily during "V-shaped" market reversals', 'Lagging indicator at tops']
     },
     'sharpe': {
-        'name': '⚖️ Sharpe Ratio Strategy',
-        'short_desc': 'Selects funds with highest risk-adjusted returns.',
-        'how_it_works': ['Calculate Sharpe Ratio for each fund', 'Rank by Sharpe', 'Select top N'],
-        'formula': 'Sharpe = (Return - Rf) / StdDev × √252',
-        'best_for': 'Consistent risk-adjusted performance',
-        'weaknesses': ['Penalizes upside volatility', 'Assumes normal distribution']
+        'name': '⚖️ Sharpe Maximization',
+        'short_desc': 'Prioritizes excess return per unit of total risk (volatility).',
+        'how_it_works': [
+            'Calculate annualized volatility (Standard Deviation) for each fund.',
+            'Calculate excess return over the Risk-Free Rate (6%).',
+            'Compute ratio: Excess Return / Volatility.',
+            'Select top N funds that deliver the most "efficient" growth.'
+        ],
+        'formula': 'Sharpe = (CAGR - Rf) / σ_total',
+        'best_for': 'Volatile or sideways markets where efficiency matters more than raw speed.',
+        'weaknesses': ['Penalizes upside volatility (big jumps)', 'Assumes normal distribution of returns']
     },
     'sortino': {
-        'name': '🎯 Sortino Ratio Strategy',
-        'short_desc': 'Selects funds with highest return per unit of downside risk.',
-        'how_it_works': ['Calculate downside deviation', 'Compute Sortino ratio', 'Select top N'],
-        'formula': 'Sortino = (Return - Rf) / Downside_Dev × √252',
-        'best_for': 'Asymmetric return distributions',
-        'weaknesses': ['Needs sufficient negative returns to calculate']
+        'name': '🎯 Sortino Optimization',
+        'short_desc': 'Focuses purely on minimizing "bad" volatility (downside deviation).',
+        'how_it_works': [
+            'Isolate negative returns (returns < 0) to calculate Downside Deviation.',
+            'Ignore upside volatility (massive gains are not penalized).',
+            'Compute ratio: Excess Return / Downside Deviation.',
+            'Select top N funds with the best asymmetric return profile.'
+        ],
+        'formula': 'Sortino = (CAGR - Rf) / σ_downside',
+        'best_for': 'Aggressive growth strategies where high upside volatility is desired.',
+        'weaknesses': ['Requires sufficient negative data points to be statistically significant']
     },
     'regime_switch': {
-        'name': '🚦 Regime Switch Strategy',
-        'short_desc': 'Momentum in bull markets, Sharpe in bear markets.',
-        'how_it_works': ['Check if price > 200 DMA (bull) or < 200 DMA (bear)', 'Bull: Use Momentum', 'Bear: Use Sharpe'],
-        'formula': 'Regime = Bull if Price > MA200 else Bear',
-        'best_for': 'Adapting to market conditions',
-        'weaknesses': ['Can whipsaw around MA']
+        'name': '🚦 Adaptive Regime Switch',
+        'short_desc': 'Dynamic switching: Momentum in Bull markets, Safety in Bear markets.',
+        'how_it_works': [
+            'Determine Market Regime using Benchmark vs 200-Day Moving Average (DMA).',
+            'BULL (Price > 200DMA): Deploy "Composite Momentum" to capture upside.',
+            'BEAR (Price < 200DMA): Deploy "Sharpe Maximization" to preserve capital.',
+            'Re-evaluate regime at every rebalance point.'
+        ],
+        'formula': 'Strategy = Momentum if (Bench > MA_200) else Sharpe',
+        'best_for': 'Full market cycles (Boom & Bust protection).',
+        'weaknesses': ['Whipsaw losses in choppy/sideways markets around the 200DMA']
     },
     'stable_momentum': {
-        'name': '⚓ Stable Momentum Strategy',
-        'short_desc': 'High momentum funds filtered for low drawdown.',
-        'how_it_works': ['Get top 2N by momentum', 'Filter for lowest drawdown', 'Select N funds'],
-        'formula': 'Pool = Top 2N by Momentum, Select = Min Drawdown from Pool',
-        'best_for': 'Momentum with crash protection',
-        'weaknesses': ['May miss high-return volatile funds']
+        'name': '⚓ Stable Momentum (Low Vol)',
+        'short_desc': 'High momentum funds filtered for structural stability.',
+        'how_it_works': [
+            'Step 1: Rank universe by Momentum and take the Top 25% (Candidate Pool).',
+            'Step 2: Calculate Maximum Drawdown (MDD) for the Candidate Pool.',
+            'Step 3: Select the Top N funds from the pool that have the LOWEST historic drawdown.',
+            'Goal: Find "smooth" winners rather than volatile runners.'
+        ],
+        'formula': 'Select = Min(MDD) from Top_Quartile(Momentum)',
+        'best_for': 'Conservative growth; avoiding "pump and dump" moves.',
+        'weaknesses': ['May underperform during "melt-up" phases driven by high-beta stocks']
     },
     'elimination': {
-        'name': '🛡️ Elimination Strategy',
-        'short_desc': 'Remove worst by DD & volatility, pick by Sharpe.',
-        'how_it_works': ['Remove bottom 25% by drawdown', 'Remove top 25% by volatility', 'Select top N by Sharpe'],
-        'formula': 'Filter by DD → Filter by Vol → Rank by Sharpe',
-        'best_for': 'Conservative portfolios',
-        'weaknesses': ['May be too conservative']
+        'name': '🛡️ Double-Filter Elimination',
+        'short_desc': 'Excludes the worst performers before picking the best.',
+        'how_it_works': [
+            'Filter 1: Remove bottom 25% funds by Max Drawdown (Risk Control).',
+            'Filter 2: Remove top 25% funds by Volatility (Uncertainty Control).',
+            'Selection: From the remaining "Quality Universe", pick Top N by Sharpe Ratio.',
+            'Philosophy: "Winning by not losing."'
+        ],
+        'formula': 'Universe - (Worst_DD ∪ Highest_Vol) → Rank by Sharpe',
+        'best_for': 'Capital preservation & steady compounding.',
+        'weaknesses': ['Can be overly conservative in raging bull markets']
     },
     'consistency': {
-        'name': '📈 Consistency Strategy',
-        'short_desc': 'Must be top 50% in 3+ of last 4 quarters.',
-        'how_it_works': ['Check quarterly rankings', 'Keep funds top 50% in 3+ quarters', 'Select by recent momentum'],
-        'formula': 'Consistent if Quarters_Top50 >= 3 out of 4',
-        'best_for': 'Long-term reliability',
-        'weaknesses': ['May miss improving funds']
+        'name': '📈 Quartile Consistency',
+        'short_desc': 'Selects funds that persistently beat peers quarter-over-quarter.',
+        'how_it_works': [
+            'Divide last 12 months into 4 discrete quarters.',
+            'Rank fund against peers in each specific quarter.',
+            'Filter: Keep only funds that were in the Top 50% for at least 3 of 4 quarters.',
+            'Selection: Rank survivors by recent 3M momentum.'
+        ],
+        'formula': 'Select if (Quartile_Rank <= 2) in ≥ 3 of last 4 Qtrs',
+        'best_for': 'Long-term reliability; filtering out "one-hit wonders".',
+        'weaknesses': ['Ignores recent turnaround stories or emerging themes']
     }
 }
 
