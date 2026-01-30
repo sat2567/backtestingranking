@@ -22,23 +22,92 @@ st.set_page_config(page_title="Fund Analysis Pro", page_icon="📈", layout="wid
 
 st.markdown("""
 <style>
+    /* Main container padding */
     .main .block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 100%; }
+    
+    /* Header Styling */
     h1 { color: #1E3A5F; font-weight: 700; padding-bottom: 0.5rem; border-bottom: 3px solid #4CAF50; margin-bottom: 1.5rem; }
+    
+    /* Native Metric Container Styling */
     div[data-testid="metric-container"] { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; padding: 15px; }
-    div[data-testid="metric-container"] label { color: rgba(255, 255, 255, 0.8) !important; }
+    div[data-testid="metric-container"] label { color: rgba(255, 255, 255, 0.9) !important; }
     div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: white !important; font-weight: 700; }
+    
+    /* Tab Styling */
     .stTabs [data-baseweb="tab-list"] { gap: 8px; background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
     .stTabs [data-baseweb="tab"] { border-radius: 8px; padding: 10px 20px; font-weight: 500; color: #333 !important; }
     .stTabs [aria-selected="true"] { background-color: #4CAF50 !important; color: white !important; }
+    
+    /* Footer & Menu Hide */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    .metric-box { background: linear-gradient(135deg, #f5f7fa 0%, #e8eef5 100%); border-radius: 12px; padding: 18px; margin: 10px 0; border-left: 5px solid #4CAF50; }
-    .metric-box h4 { color: #1E3A5F; margin: 0 0 10px 0; }
-    .metric-box .formula { background: #263238; color: #80cbc4; padding: 10px 15px; border-radius: 8px; font-family: monospace; margin: 10px 0; }
-    .strategy-box { background: white; border-radius: 12px; padding: 20px; margin: 15px 0; box-shadow: 0 3px 12px rgba(0,0,0,0.08); border-left: 5px solid #2196F3; }
-    .info-banner { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 12px; margin-bottom: 20px; }
-    .info-banner h2 { color: white; margin: 0; }
-    .info-banner p { color: rgba(255,255,255,0.8); margin: 5px 0 0 0; }
+    
+    /* CUSTOM METRIC BOX (High Contrast Fix) */
+    .metric-box { 
+        background: linear-gradient(135deg, #f5f7fa 0%, #e8eef5 100%); 
+        border-radius: 12px; 
+        padding: 18px; 
+        margin: 10px 0; 
+        border-left: 5px solid #4CAF50;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        color: #1f2937; /* Force dark text */
+    }
+    .metric-box h4 { 
+        color: #1E3A5F !important; 
+        margin: 0 0 10px 0; 
+        font-weight: 700;
+    }
+    .metric-box p { 
+        color: #374151 !important; /* Dark Grey for readability */
+        margin: 5px 0;
+        font-size: 0.95rem;
+    }
+    .metric-box .formula { 
+        background: #263238; 
+        color: #80cbc4 !important; 
+        padding: 10px 15px; 
+        border-radius: 8px; 
+        font-family: 'Courier New', monospace; 
+        margin: 10px 0;
+        font-size: 0.9rem;
+    }
+    
+    /* CUSTOM STRATEGY BOX (High Contrast Fix) */
+    .strategy-box { 
+        background: white; 
+        border-radius: 12px; 
+        padding: 20px; 
+        margin: 15px 0; 
+        box-shadow: 0 3px 12px rgba(0,0,0,0.08); 
+        border-left: 5px solid #2196F3;
+        color: #1f2937; /* Force dark text */
+    }
+    .strategy-box h4 {
+        color: #1E3A5F !important;
+        margin-top: 0;
+    }
+    .strategy-box p {
+        color: #374151 !important;
+        line-height: 1.5;
+    }
+    .strategy-box code {
+        background-color: #f1f5f9;
+        color: #d63384;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-weight: bold;
+    }
+
+    /* INFO BANNER */
+    .info-banner { 
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+        padding: 20px; 
+        border-radius: 12px; 
+        margin-bottom: 20px; 
+        color: white;
+    }
+    .info-banner h2 { color: white !important; margin: 0; border: none; }
+    .info-banner p { color: rgba(255,255,255,0.9) !important; margin: 5px 0 0 0; }
 </style>
 """, unsafe_allow_html=True)
 
