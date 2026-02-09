@@ -854,10 +854,10 @@ def render_backtest_tab():
                     c = (e.iloc[-1]['value']/100)**(1/y)-1 if y > 0 else 0
                     bc = (b.iloc[-1]['value']/100)**(1/y)-1 if y > 0 else 0
                     md = calculate_max_dd(pd.Series(e['value'].values, index=e['date']))
-                    res.append({'Hold': get_holding_label(hp), 'CAGR%': c*100, 'Bench%': bc*100, 'Alpha%': (c-bc)*100, 'MaxDD%': md*100 if md else 0, 'HR%': h['hit_rate'].mean()*100, 'Win%': (h['return']>0).mean()*100, 'Trades': len(h)})
+                    res.append({'Hold': get_holding_label(hp), 'CAGR%': c*100, 'Bench%': bc*100, 'Alpha%': (c-bc)*100, 'MaxDD%': md*100 if md else 0,'Win%': (h['return']>0).mean()*100, 'Trades': len(h)})
             
             if res:
-                st.dataframe(pd.DataFrame(res).style.format({'CAGR%': '{:.2f}', 'Bench%': '{:.2f}', 'Alpha%': '{:+.2f}', 'MaxDD%': '{:.2f}', 'HR%': '{:.1f}', 'Win%': '{:.1f}'}).background_gradient(subset=['CAGR%', 'Alpha%', 'HR%'], cmap='RdYlGn'), use_container_width=True)
+                st.dataframe(pd.DataFrame(res).style.format({'CAGR%': '{:.2f}', 'Bench%': '{:.2f}', 'Alpha%': '{:+.2f}', 'MaxDD%': '{:.2f}' 'Win%': '{:.1f}'}).background_gradient(subset=['CAGR%', 'Alpha%', 'HR%'], cmap='RdYlGn'), use_container_width=True)
             
             st.divider()
             st.markdown(f"#### Detail: {get_holding_label(hold)}")
