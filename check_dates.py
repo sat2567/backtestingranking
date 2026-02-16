@@ -576,22 +576,23 @@ def render_current_picks_panel(nav_df, scheme_map, benchmark, top_n, hold):
     st.markdown("### 🧠 Smart Ensemble — Current Picks (Buy Today)")
     picks, vote_counts = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
     if not picks: st.warning("Not enough data."); return
-    # Compute benchmark 1Y return for alpha calc
-    bench_1y = None
-    if benchmark is not None and len(benchmark) >= 252:
-        bench_1y = (benchmark.iloc[-1] / benchmark.iloc[-252] - 1) * 100
+    # Run ensemble backtest to get the actual strategy alpha
+    h, e, b, _ = run_backtest(nav_df, 'smart_ensemble', top_n, 5, hold, {}, benchmark, scheme_map)
+    strat_alpha_str = "N/A"
+    strat_alpha_color = "#999"
+    if not e.empty:
+        yrs = (e.iloc[-1]['date'] - e.iloc[0]['date']).days / 365.25
+        if yrs > 0:
+            cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1
+            bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1
+            strat_alpha = (cagr - bcagr) * 100
+            strat_alpha_str = f"{strat_alpha:+.1f}%"
+            strat_alpha_color = "#4caf50" if strat_alpha >= 0 else "#f44336"
+    st.markdown(f'<div style="background:linear-gradient(135deg,#e8f5e9,#f1f8e9);border-radius:12px;padding:14px 18px;margin-bottom:12px;border:1px solid #c8e6c9;"><span style="font-size:0.85rem;color:#555;">Strategy Backtested Alpha (annualized):</span> <strong style="font-size:1.1rem;color:{strat_alpha_color}">{strat_alpha_str}</strong></div>', unsafe_allow_html=True)
     cols = st.columns(min(len(picks), 5))
     for idx, pick in enumerate(picks):
         with cols[idx % len(cols)]:
-            fund_1y = pick.get('ret_1y')
-            if fund_1y and not pd.isna(fund_1y) and bench_1y and not pd.isna(bench_1y):
-                alpha_val = fund_1y - bench_1y
-                alpha_str = f"{alpha_val:+.1f}%"
-                alpha_color = "#4caf50" if alpha_val >= 0 else "#f44336"
-            else:
-                alpha_str = "N/A"
-                alpha_color = "#999"
-            st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:50]}</div><div style="margin-top:6px;font-size:0.88rem;">Alpha: <strong style="color:{alpha_color}">{alpha_str}</strong></div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:50]}</div></div>', unsafe_allow_html=True)
 
 def render_explorer_tab():
     st.markdown('<div class="info-banner"><h2>📊 Category Explorer</h2><p>Comprehensive analysis with smart recommendations</p></div>', unsafe_allow_html=True)
