@@ -175,16 +175,15 @@ STRATEGY_DEFINITIONS = {
         'weaknesses': ['Ignores turnaround stories']
     },
     'smart_ensemble': {
-        'name': '🧠 Smart Ensemble (NEW)', 'short_desc': 'Meta-strategy: multi-strategy voting + trend + drawdown filter.',
+        'name': '🧠 Smart Ensemble', 'short_desc': 'Meta-strategy: multi-strategy voting ranked by vol-adjusted momentum.',
         'how_it_works': [
             'Run all 7 base strategies, collect Top N picks each.',
-            'Count votes: funds picked by 3+ strategies get priority.',
-            'Trend Filter: NAV must be above 50-day MA.',
-            'Drawdown Filter: exclude funds in >10% current drawdown.',
-            'Rank by vote count, then vol-adjusted momentum.'
+            'Count votes: funds picked by multiple strategies get priority.',
+            'Rank by vote count first, then by vol-adjusted momentum as tiebreaker.',
+            'Consensus-based: only funds with broad strategy agreement survive.'
         ],
-        'formula': 'Votes(7 strats) -> Trend(NAV>50DMA) -> DD(<10%) -> Rank', 'best_for': 'Maximum hit rate, all-weather.',
-        'weaknesses': ['Conservative, may miss early breakouts']
+        'formula': 'Votes(7 strats) -> Rank by votes desc, then Vol-Adj-Mom desc', 'best_for': 'Maximum conviction, all-weather.',
+        'weaknesses': ['Conservative, may miss early breakouts only one strategy catches']
     }
 }
 
@@ -495,9 +494,8 @@ def compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=5, holding_days=
         full_s = nav_df[fid].dropna()
         vam = calculate_vol_adjusted_momentum(full_s, w3, w6, w12) if len(full_s) >= 260 else 0
         candidates.append({**info, 'votes': data['votes'], 'strategies': data['strategies'],
-                           'trend_ok': check_trend_confirmation(full_s), 'dd_ok': check_drawdown_recency(full_s),
                            'vol_adj_mom': vam if not pd.isna(vam) else 0})
-    candidates.sort(key=lambda x: (-(1 if x['trend_ok'] else 0) - (1 if x['dd_ok'] else 0), -x['votes'], -x['vol_adj_mom']))
+    candidates.sort(key=lambda x: (-x['votes'], -x['vol_adj_mom']))
     return candidates[:top_n], vote_counts
 
 # ============================================================================
@@ -576,9 +574,22 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold):
     all_results = result['all_results']
 
     # === SECTION 1: Best Strategy Banner + Its Fund Picks ===
+    best_key = best['key']
+    best_def = STRATEGY_DEFINITIONS[best_key]
     st.markdown(f"""<div class="best-strat-banner">
         <h3>🏅 Best Strategy: {best['name']}</h3>
         <p>Highest Alpha for {get_holding_label(hold)} holding • Picking {top_n} funds — <strong>{best['alpha']:+.1f}% alpha</strong> over benchmark</p>
+    </div>""", unsafe_allow_html=True)
+
+    # Strategy explanation
+    st.markdown(f"""<div class="strategy-box">
+        <h4>How {best['name']} Works</h4>
+        <p><strong>Summary:</strong> {best_def['short_desc']}</p>
+        <p><strong>Steps:</strong></p>
+        <p>{'<br>'.join([f'{i+1}. {step}' for i, step in enumerate(best_def['how_it_works'])])}</p>
+        <p><strong>Formula:</strong> <code>{best_def['formula']}</code></p>
+        <p><strong>Best for:</strong> {best_def['best_for']}</p>
+        <p><strong>Weaknesses:</strong> {', '.join(best_def['weaknesses'])}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"### 🏆 Top {top_n} Funds to Buy Today — via {best['name']}")
@@ -778,7 +789,7 @@ def run_backtest(nav, strategy, top_n, target_n, hold_days, mom_cfg, bench, sche
             for sn, pks in base_picks.items():
                 for fid in pks: vm[fid] = vm.get(fid, 0) + 1
             cands = [(fid, vm[fid], scores.get(fid, {})) for fid in vm]
-            cands.sort(key=lambda x: (-((1 if x[2].get('trend_ok') else 0) + (1 if x[2].get('dd_ok') else 0)), -x[1], -(x[2].get('vol_adj_mom') or 0)))
+            cands.sort(key=lambda x: (-x[1], -(x[2].get('vol_adj_mom') or 0)))
             selected = [c[0] for c in cands[:top_n]]
         elif strategy == 'stable_momentum':
             pool = [f for f, _ in sorted(scores.items(), key=lambda x: (x[1]['score'], x[1]['sharpe'] or 0), reverse=True)[:top_n*2]]
