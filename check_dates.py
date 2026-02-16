@@ -556,36 +556,42 @@ def render_best_strategy_banner(nav_df, scheme_map, benchmark, top_n, target_n, 
                 yrs = (e.iloc[-1]['date'] - e.iloc[0]['date']).days / 365.25
                 cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
                 bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
-                mdd = calculate_max_dd(pd.Series(e['value'].values, index=e['date']))
-                hr = h['hit_rate'].mean() if 'hit_rate' in h.columns else 0
-                results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'cagr': cagr * 100, 'alpha': (cagr - bcagr) * 100, 'mdd': mdd * 100 if mdd else 0, 'hr': hr * 100})
+                results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': (cagr - bcagr) * 100, 'cfg': cfg})
     if not results: return
     results.sort(key=lambda x: x['alpha'], reverse=True)
     best = results[0]
-    st.markdown(f'<div class="best-strat-banner"><h3>🏅 Recommended: {best["name"]}</h3><p>Highest Alpha for {get_holding_label(hold)}</p><div class="strat-metrics"><div class="strat-metric"><div class="val">{best["cagr"]:.1f}%</div><div class="lbl">CAGR</div></div><div class="strat-metric"><div class="val">{best["alpha"]:+.1f}%</div><div class="lbl">Alpha</div></div><div class="strat-metric"><div class="val">{best["mdd"]:.1f}%</div><div class="lbl">Max DD</div></div><div class="strat-metric"><div class="val">{best["hr"]:.0f}%</div><div class="lbl">Hit Rate</div></div></div></div>', unsafe_allow_html=True)
+    # Get current fund picks for the best strategy
+    best_picks = compute_current_strategy_picks(nav_df, scheme_map, benchmark, best['key'], top_n=top_n, holding_days=hold)
+    picks_html = ''.join([f'<div style="display:inline-block;background:rgba(255,255,255,0.15);padding:4px 12px;border-radius:8px;margin:3px 4px;font-size:0.82rem;">{p["name"][:40]}</div>' for p in best_picks])
+    st.markdown(f"""<div class="best-strat-banner">
+        <h3>🏅 Recommended: {best['name']}</h3>
+        <p>Highest Alpha for {get_holding_label(hold)} — <strong>{best['alpha']:+.1f}% alpha</strong> over benchmark</p>
+        <div style="margin-top:12px;"><span style="font-size:0.78rem;opacity:0.8;">Current Picks:</span><br>{picks_html}</div>
+    </div>""", unsafe_allow_html=True)
     with st.expander("📊 All Strategy Rankings", expanded=False):
-        df = pd.DataFrame(results)[['name', 'cagr', 'alpha', 'mdd', 'hr']].rename(columns={'name': 'Strategy', 'cagr': 'CAGR %', 'alpha': 'Alpha %', 'mdd': 'Max DD %', 'hr': 'Hit Rate %'})
-        st.dataframe(df.style.format({'CAGR %': '{:.2f}', 'Alpha %': '{:+.2f}', 'Max DD %': '{:.2f}', 'Hit Rate %': '{:.1f}'}).background_gradient(subset=['Alpha %'], cmap='RdYlGn'), use_container_width=True)
+        df = pd.DataFrame(results)[['name', 'alpha']].rename(columns={'name': 'Strategy', 'alpha': 'Alpha %'})
+        st.dataframe(df.style.format({'Alpha %': '{:+.2f}'}).background_gradient(subset=['Alpha %'], cmap='RdYlGn'), use_container_width=True)
 
 def render_current_picks_panel(nav_df, scheme_map, benchmark, top_n, hold):
     st.markdown("### 🧠 Smart Ensemble — Current Picks (Buy Today)")
     picks, vote_counts = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
     if not picks: st.warning("Not enough data."); return
-    smap = {k: v['name'].split(' ')[0] for k, v in STRATEGY_DEFINITIONS.items()}
+    # Compute benchmark 1Y return for alpha calc
+    bench_1y = None
+    if benchmark is not None and len(benchmark) >= 252:
+        bench_1y = (benchmark.iloc[-1] / benchmark.iloc[-252] - 1) * 100
     cols = st.columns(min(len(picks), 5))
     for idx, pick in enumerate(picks):
         with cols[idx % len(cols)]:
-            vc = "vote-high" if pick['votes'] >= 4 else "vote-med" if pick['votes'] >= 2 else "vote-low"
-            ss = ', '.join([smap.get(s, s) for s in pick['strategies']])
-            ti, di = "✅" if pick['trend_ok'] else "⚠️", "✅" if pick['dd_ok'] else "⚠️"
-            sh = f"{pick['sharpe']:.2f}" if pick.get('sharpe') and not pd.isna(pick['sharpe']) else "N/A"
-            r3 = f"{pick['ret_3m']:.1f}%" if pick.get('ret_3m') and not pd.isna(pick['ret_3m']) else "N/A"
-            st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:45]}</div><div class="pick-stats">Sharpe: <strong>{sh}</strong> | 3M: <strong>{r3}</strong></div><div><span class="vote-badge {vc}">{pick["votes"]}/7 votes</span><span style="font-size:0.78rem;">{ti} Trend {di} DD</span></div><div style="font-size:0.72rem;color:#777;margin-top:4px;">By: {ss}</div></div>', unsafe_allow_html=True)
-    with st.expander("🗳️ Full Vote Breakdown", expanded=False):
-        vd = [{'Fund': scheme_map.get(fid, fid)[:40], 'Votes': d['votes'], 'Strategies': ', '.join(d['strategies']),
-               'Trend': '✅' if d['info'].get('trend_ok') else '❌', 'DD': '✅' if d['info'].get('dd_ok') else '❌'}
-              for fid, d in sorted(vote_counts.items(), key=lambda x: -x[1]['votes'])]
-        if vd: st.dataframe(pd.DataFrame(vd).head(20), use_container_width=True)
+            fund_1y = pick.get('ret_1y')
+            if fund_1y and not pd.isna(fund_1y) and bench_1y and not pd.isna(bench_1y):
+                alpha_val = fund_1y - bench_1y
+                alpha_str = f"{alpha_val:+.1f}%"
+                alpha_color = "#4caf50" if alpha_val >= 0 else "#f44336"
+            else:
+                alpha_str = "N/A"
+                alpha_color = "#999"
+            st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:50]}</div><div style="margin-top:6px;font-size:0.88rem;">Alpha: <strong style="color:{alpha_color}">{alpha_str}</strong></div></div>', unsafe_allow_html=True)
 
 def render_explorer_tab():
     st.markdown('<div class="info-banner"><h2>📊 Category Explorer</h2><p>Comprehensive analysis with smart recommendations</p></div>', unsafe_allow_html=True)
