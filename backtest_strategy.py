@@ -320,6 +320,26 @@ def adaptive_momentum_weights(holding_days):
 # 6. DATA LOADING
 # ============================================================================
 
+def is_regular_growth_fund(name):
+    """Filter out non-regular-growth funds: IDCW, Dividend, Direct, Bonus, Institutional etc."""
+    n = str(name).lower()
+    exclude_keywords = [
+        'idcw', 'dividend', 'div ', 'div.', 'div)', 
+        'direct', 'dir ', 'dir)',
+        'bonus',
+        'institutional',
+        'segregated',
+        'payout',
+        'reinvestment',  # IDCW reinvestment
+        'monthly', 'quarterly', 'annual',  # periodic dividend plans
+        'option', 'opt',  # dividend option
+    ]
+    # Exclude if any keyword matches
+    for kw in exclude_keywords:
+        if kw in n:
+            return False
+    return True
+
 @st.cache_data
 def load_fund_data_raw(category_key):
     filename = FILE_MAPPING.get(category_key)
@@ -335,8 +355,12 @@ def load_fund_data_raw(category_key):
         dates = pd.to_datetime(data_df.iloc[:, 0], errors='coerce')
         nav_wide = pd.DataFrame(index=dates)
         scheme_map = {}
+        skipped = 0
         for i, name in enumerate(fund_names):
             if pd.notna(name) and str(name).strip():
+                if not is_regular_growth_fund(name):
+                    skipped += 1
+                    continue
                 code = str(abs(hash(name)) % (10 ** 8))
                 scheme_map[code] = name
                 nav_wide[code] = pd.to_numeric(data_df.iloc[:, i+1], errors='coerce').values
