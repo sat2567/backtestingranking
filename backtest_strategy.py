@@ -552,8 +552,10 @@ def create_drawdown_chart(series, name):
 # 9. EXPLORER TAB
 # ============================================================================
 
-def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold):
-    """Find best strategy by alpha AND return its current picks. Single source of truth."""
+def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, optimize_by='alpha'):
+    """Find best strategy by chosen criteria. Single source of truth.
+    optimize_by: 'alpha', 'hit_rate', or 'balanced'
+    """
     all_strats = {
         'momentum': {'w_3m': 0.33, 'w_6m': 0.33, 'w_12m': 0.33, 'risk_adjust': True},
         'sharpe': {}, 'sortino': {}, 'regime_switch': {}, 'stable_momentum': {},
@@ -567,10 +569,26 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold):
             cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
             bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
             alpha = (cagr - bcagr) * 100
-            results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': alpha, 'cfg': cfg})
+            hr = h['hit_rate'].mean() * 100 if 'hit_rate' in h.columns and len(h) > 0 else 0
+            results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': alpha, 'hit_rate': hr, 'cfg': cfg})
     if not results:
         return None, []
-    results.sort(key=lambda x: x['alpha'], reverse=True)
+    # Sort based on user's optimization choice
+    if optimize_by == 'hit_rate':
+        results.sort(key=lambda x: x['hit_rate'], reverse=True)
+    elif optimize_by == 'balanced':
+        # Normalize alpha and hit_rate to 0-1 range, then average
+        max_alpha = max(r['alpha'] for r in results) or 1
+        min_alpha = min(r['alpha'] for r in results)
+        alpha_range = max_alpha - min_alpha if max_alpha != min_alpha else 1
+        max_hr = max(r['hit_rate'] for r in results) or 1
+        min_hr = min(r['hit_rate'] for r in results)
+        hr_range = max_hr - min_hr if max_hr != min_hr else 1
+        for r in results:
+            r['balanced_score'] = 0.5 * ((r['alpha'] - min_alpha) / alpha_range) + 0.5 * ((r['hit_rate'] - min_hr) / hr_range)
+        results.sort(key=lambda x: x['balanced_score'], reverse=True)
+    else:  # alpha
+        results.sort(key=lambda x: x['alpha'], reverse=True)
     best = results[0]
     # Get current picks for the BEST strategy
     if best['key'] == 'smart_ensemble':
@@ -581,14 +599,14 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold):
         best_picks = [{'fund_id': p['fund_id'], 'name': p['name']} for p in picks_raw]
     return {'best': best, 'all_results': results, 'picks': best_picks}, best_picks
 
-def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold):
+def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimize_by='alpha'):
     """Single unified dashboard: best strategy → its picks → ensemble comparison."""
     regime, pct = get_current_regime(benchmark)
     rc = "#4caf50" if "🟢" in regime else "#f44336" if "🔴" in regime else "#ff9800"
     st.markdown(f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;"><div style="background:{rc};color:white;padding:6px 16px;border-radius:20px;font-weight:700;font-size:0.9rem;">Market: {regime}</div><div style="color:#555;font-size:0.85rem;">Bench vs 200DMA: <strong>{pct:+.1f}%</strong></div></div>', unsafe_allow_html=True)
 
     with st.spinner("🔍 Analyzing all strategies to find the best..."):
-        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, 5, hold)
+        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, 5, hold, optimize_by)
 
     if result is None:
         st.warning("Not enough data to run strategies.")
@@ -597,12 +615,22 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold):
     best = result['best']
     all_results = result['all_results']
 
+    # Optimization label
+    opt_labels = {'alpha': 'Highest Alpha', 'hit_rate': 'Highest Hit Rate', 'balanced': 'Balanced (Alpha + Hit Rate)'}
+    opt_label = opt_labels.get(optimize_by, 'Highest Alpha')
+
     # === SECTION 1: Best Strategy Banner + Its Fund Picks ===
     best_key = best['key']
     best_def = STRATEGY_DEFINITIONS[best_key]
+    alpha_str = f"{best['alpha']:+.1f}%"
+    hr_str = f"{best['hit_rate']:.0f}%"
     st.markdown(f"""<div class="best-strat-banner">
         <h3>🏅 Best Strategy: {best['name']}</h3>
-        <p>Highest Alpha for {get_holding_label(hold)} holding • Picking {top_n} funds — <strong>{best['alpha']:+.1f}% alpha</strong> over benchmark</p>
+        <p>Selected by: <strong>{opt_label}</strong> for {get_holding_label(hold)} holding • {top_n} picks</p>
+        <div class="strat-metrics">
+            <div class="strat-metric"><div class="val">{alpha_str}</div><div class="lbl">Alpha</div></div>
+            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate</div></div>
+        </div>
     </div>""", unsafe_allow_html=True)
 
     # Strategy explanation
@@ -651,9 +679,10 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold):
     st.divider()
 
     # === SECTION 3: All Strategies Ranked ===
-    with st.expander("📊 All Strategy Rankings by Alpha", expanded=False):
-        df = pd.DataFrame(all_results)[['name', 'alpha']].rename(columns={'name': 'Strategy', 'alpha': 'Alpha %'})
-        st.dataframe(df.style.format({'Alpha %': '{:+.2f}'}).background_gradient(subset=['Alpha %'], cmap='RdYlGn'), use_container_width=True)
+    with st.expander("📊 All Strategy Rankings", expanded=False):
+        df = pd.DataFrame(all_results)[['name', 'alpha', 'hit_rate']].rename(columns={'name': 'Strategy', 'alpha': 'Alpha %', 'hit_rate': 'Hit Rate %'})
+        sort_col = 'Alpha %' if optimize_by == 'alpha' else 'Hit Rate %' if optimize_by == 'hit_rate' else 'Alpha %'
+        st.dataframe(df.style.format({'Alpha %': '{:+.2f}', 'Hit Rate %': '{:.1f}'}).background_gradient(subset=[sort_col], cmap='RdYlGn'), use_container_width=True)
 
     # === SECTION 4: Performance chart of best strategy picks ===
     pick_ids = [p['fund_id'] for p in best_picks if p['fund_id'] in nav_df.columns]
@@ -663,11 +692,12 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold):
 def render_explorer_tab():
     st.markdown('<div class="info-banner"><h2>📊 Category Explorer</h2><p>Comprehensive analysis with smart recommendations</p></div>', unsafe_allow_html=True)
     show_metric_definitions()
-    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 1, 1, 1.5])
     with c1: category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()))
     with c2: view = st.selectbox("👁️ View", ["🏆 Dashboard", "📈 Metrics", "📊 Quarterly Rankings", "🔍 Fund Deep Dive"])
     with c3: top_n_exp = st.number_input("Picks", 1, 10, 5, key="exp_topn")
     with c4: hold_exp = st.selectbox("Hold", HOLDING_PERIODS, index=1, format_func=get_holding_label, key="exp_hold")
+    with c5: optimize_by = st.selectbox("🎯 Optimize", ["Max Alpha", "Max Hit Rate", "Balanced"], key="exp_opt")
     nav_df, scheme_map = load_fund_data_raw(category)
     benchmark = load_nifty_data()
     if nav_df is None: st.error("Could not load data."); return
@@ -678,7 +708,8 @@ def render_explorer_tab():
     st.divider()
 
     if "Dashboard" in view:
-        render_unified_dashboard(nav_df, scheme_map, benchmark, top_n_exp, hold_exp)
+        opt_map = {"Max Alpha": "alpha", "Max Hit Rate": "hit_rate", "Balanced": "balanced"}
+        render_unified_dashboard(nav_df, scheme_map, benchmark, top_n_exp, hold_exp, opt_map.get(optimize_by, "alpha"))
     elif "Metrics" in view:
         mdf = calculate_comprehensive_metrics(nav_df, scheme_map, benchmark)
         if mdf.empty: st.warning("No data."); return
