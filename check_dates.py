@@ -542,13 +542,7 @@ def render_top5_panel(nav_df, scheme_map, benchmark):
     for idx, (_, row) in enumerate(top5.iterrows()):
         if idx >= 5: break
         with cols[idx]:
-            tb = '<span class="badge badge-green">✅ Uptrend</span>' if row.get('Trend OK') else '<span class="badge badge-orange">⚠️ No Trend</span>'
-            db = '<span class="badge badge-green">✅ DD OK</span>' if row.get('DD OK') else '<span class="badge badge-orange">⚠️ In DD</span>'
-            cv = f"{row.get('CAGR %', 0):.1f}%" if pd.notna(row.get('CAGR %')) else "N/A"
-            sv = f"{row.get('Sharpe', 0):.2f}" if pd.notna(row.get('Sharpe')) else "N/A"
-            dv = f"{row.get('Max DD %', 0):.1f}%" if pd.notna(row.get('Max DD %')) else "N/A"
-            r3 = f"{row.get('Return 3M %', 0):.1f}%" if pd.notna(row.get('Return 3M %')) else "N/A"
-            st.markdown(f'<div class="top-fund-card"><div class="rank">#{idx+1}</div><div class="fund-name">{row["Fund Name"][:40]}</div><div class="fund-stats"><span>CAGR: <strong>{cv}</strong></span><br><span>Sharpe: <strong>{sv}</strong></span><br><span>MaxDD: <strong>{dv}</strong></span><br><span>3M: <strong>{r3}</strong></span></div><div style="margin-top:6px;">{tb} {db}</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="top-fund-card"><div class="rank">#{idx+1}</div><div class="fund-name">{row["Fund Name"][:50]}</div></div>', unsafe_allow_html=True)
 
 def render_best_strategy_banner(nav_df, scheme_map, benchmark, top_n, target_n, hold):
     with st.spinner("🔍 Finding best strategy..."):
