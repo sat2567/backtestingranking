@@ -606,7 +606,7 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
     st.markdown(f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;"><div style="background:{rc};color:white;padding:6px 16px;border-radius:20px;font-weight:700;font-size:0.9rem;">Market: {regime}</div><div style="color:#555;font-size:0.85rem;">Bench vs 200DMA: <strong>{pct:+.1f}%</strong></div></div>', unsafe_allow_html=True)
 
     with st.spinner("🔍 Analyzing all strategies to find the best..."):
-        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, top_n, hold, optimize_by)
+        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, top_n + 3, hold, optimize_by)
 
     if result is None:
         st.warning("Not enough data to run strategies.")
@@ -624,12 +624,13 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
     best_def = STRATEGY_DEFINITIONS[best_key]
     alpha_str = f"{best['alpha']:+.1f}%"
     hr_str = f"{best['hit_rate']:.0f}%"
+    target_display = top_n + 3
     st.markdown(f"""<div class="best-strat-banner">
         <h3>🏅 Best Strategy: {best['name']}</h3>
         <p>Selected by: <strong>{opt_label}</strong> for {get_holding_label(hold)} holding • {top_n} picks</p>
         <div class="strat-metrics">
             <div class="strat-metric"><div class="val">{alpha_str}</div><div class="lbl">Alpha</div></div>
-            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate</div></div>
+            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate (Top {top_n} in {target_display})</div></div>
         </div>
     </div>""", unsafe_allow_html=True)
 
