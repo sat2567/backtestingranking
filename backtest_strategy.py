@@ -601,12 +601,9 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, opt
 
 def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimize_by='alpha'):
     """Single unified dashboard: best strategy → its picks → ensemble comparison."""
-    regime, pct = get_current_regime(benchmark)
-    rc = "#4caf50" if "🟢" in regime else "#f44336" if "🔴" in regime else "#ff9800"
-    st.markdown(f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;"><div style="background:{rc};color:white;padding:6px 16px;border-radius:20px;font-weight:700;font-size:0.9rem;">Market: {regime}</div><div style="color:#555;font-size:0.85rem;">Bench vs 200DMA: <strong>{pct:+.1f}%</strong></div></div>', unsafe_allow_html=True)
 
     with st.spinner("🔍 Analyzing all strategies to find the best..."):
-        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, 5, hold, optimize_by)
+        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, top_n + 3, hold, optimize_by)
 
     if result is None:
         st.warning("Not enough data to run strategies.")
@@ -624,6 +621,7 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
     best_def = STRATEGY_DEFINITIONS[best_key]
     alpha_str = f"{best['alpha']:+.1f}%"
     hr_str = f"{best['hit_rate']:.0f}%"
+    target_display = top_n + 3
     st.markdown(f"""<div class="best-strat-banner">
         <h3>🏅 Best Strategy: {best['name']}</h3>
         <p>Selected by: <strong>{opt_label}</strong> for {get_holding_label(hold)} holding • {top_n} picks</p>
@@ -640,8 +638,6 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
         <p><strong>Steps:</strong></p>
         <p>{'<br>'.join([f'{i+1}. {step}' for i, step in enumerate(best_def['how_it_works'])])}</p>
         <p><strong>Formula:</strong> <code>{best_def['formula']}</code></p>
-        <p><strong>Best for:</strong> {best_def['best_for']}</p>
-        <p><strong>Weaknesses:</strong> {', '.join(best_def['weaknesses'])}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"### 🏆 Top {top_n} Funds to Buy Today — via {best['name']}")
@@ -890,7 +886,7 @@ def run_backtest(nav, strategy, top_n, target_n, hold_days, mom_cfg, bench, sche
         actual_top = [f for f, _ in sorted(valid.items(), key=lambda x: x[1], reverse=True)[:target_n]]
         sel_valid = [f for f in selected if f in valid]
         hits = len(set(sel_valid) & set(actual_top))
-        hr = min((hits / len(sel_valid) if sel_valid else 0) + 0.05, 1.0)
+        hr = hits / len(sel_valid) if sel_valid else 0
         pret = np.mean([valid[f] for f in sel_valid]) if sel_valid else 0
         bret = (bench.asof(exit_dt) / bench.asof(entry_dt) - 1) if bench is not None else 0
         cap *= (1 + pret); bcap *= (1 + bret)
