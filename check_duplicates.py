@@ -601,9 +601,6 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, opt
 
 def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimize_by='alpha'):
     """Single unified dashboard: best strategy → its picks → ensemble comparison."""
-    regime, pct = get_current_regime(benchmark)
-    rc = "#4caf50" if "🟢" in regime else "#f44336" if "🔴" in regime else "#ff9800"
-    st.markdown(f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;"><div style="background:{rc};color:white;padding:6px 16px;border-radius:20px;font-weight:700;font-size:0.9rem;">Market: {regime}</div><div style="color:#555;font-size:0.85rem;">Bench vs 200DMA: <strong>{pct:+.1f}%</strong></div></div>', unsafe_allow_html=True)
 
     with st.spinner("🔍 Analyzing all strategies to find the best..."):
         result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, top_n + 3, hold, optimize_by)
@@ -641,8 +638,6 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
         <p><strong>Steps:</strong></p>
         <p>{'<br>'.join([f'{i+1}. {step}' for i, step in enumerate(best_def['how_it_works'])])}</p>
         <p><strong>Formula:</strong> <code>{best_def['formula']}</code></p>
-        <p><strong>Best for:</strong> {best_def['best_for']}</p>
-        <p><strong>Weaknesses:</strong> {', '.join(best_def['weaknesses'])}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"### 🏆 Top {top_n} Funds to Buy Today — via {best['name']}")
