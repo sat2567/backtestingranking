@@ -630,7 +630,7 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
         <p>Selected by: <strong>{opt_label}</strong> for {get_holding_label(hold)} holding • {top_n} picks</p>
         <div class="strat-metrics">
             <div class="strat-metric"><div class="val">{alpha_str}</div><div class="lbl">Alpha</div></div>
-            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate (Top {top_n} in {target_display})</div></div>
+            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate</div></div>
         </div>
     </div>""", unsafe_allow_html=True)
 
