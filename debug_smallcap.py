@@ -1,34 +1,18 @@
 """
-ML Fund Predictor v2 — Learning-to-Rank + Pairwise + Multi-Strategy
-=====================================================================
-WHY v1 (Classification) FAILED — and how v2 fixes each issue:
+Unified Fund Predictor — ML + Rule-Based + Consensus
+=====================================================
+Combines:
+  A) 8 Rule-Based strategies (from backtest_strategy.py):
+     1. Composite Momentum  2. Sharpe  3. Sortino  4. Regime Switch
+     5. Stable Momentum  6. Elimination  7. Consistency  8. Smart Ensemble
+  B) 5 ML strategies (from ml_fund_predictor_v2.py):
+     1. Graded Regression  2. Return Regression  3. MLP Neural Net
+     4. Pairwise Ranking  5. ML Ensemble
+  C) "Run All" mode: runs every strategy, shows comparison matrix
+  D) Consensus Picks: funds appearing across ALL methodologies
 
-PROBLEM 1: Binary labels destroy information
-  v1: Label = {0 or 1} — "top 5" vs "not top 5"
-  Fund ranked #6 gets label=0, same as fund ranked #50
-  → Model can't distinguish near-misses from terrible funds
-  FIX: Use GRADED RELEVANCE (return percentile rank as label)
-  
-PROBLEM 2: Classification loss ≠ Ranking loss
-  v1: Minimizes cross-entropy (probability accuracy)
-  A fund with P(top5)=0.49 vs 0.51 is a massive miss in classification
-  but irrelevant for ranking (both are borderline)
-  FIX: Use PAIRWISE RANKING LOSS — directly optimizes "is fund A > fund B?"
-
-PROBLEM 3: Not enough training data
-  v1: Non-overlapping windows → ~12-20 training periods for 5 years
-  Each period has ~50 samples → only 600-1000 total training samples
-  FIX: SLIDING WINDOW with step_days=21 → 5-10x more training data
-
-PROBLEM 4: Features not tailored for ranking
-  v1: Absolute features only (ret_63d = 15%)  
-  FIX: Add PAIRWISE DIFFERENCE features and TEMPORAL FEATURES
-  
-PROBLEM 5: Single model
-  v1: One model type
-  FIX: MULTI-STRATEGY ensemble with specialized models for different regimes
-
-Run: streamlit run ml_fund_predictor_v2.py
+Run: streamlit run unified_fund_predictor.py
+Requires: streamlit, plotly, scikit-learn, scipy, pandas, numpy, openpyxl
 """
 
 import streamlit as st
@@ -38,12 +22,11 @@ import os
 import warnings
 import plotly.graph_objects as go
 import plotly.express as px
-from scipy.stats import rankdata, percentileofscore
+from scipy.stats import rankdata
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
     HistGradientBoostingRegressor,
     RandomForestRegressor,
-    GradientBoostingRegressor,
 )
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import RobustScaler
@@ -52,9 +35,9 @@ from sklearn.metrics import ndcg_score
 warnings.filterwarnings("ignore")
 
 # ============================================================================
-# 1. CONFIG
+# 1. CONFIG & STYLING
 # ============================================================================
-st.set_page_config(page_title="ML Fund Predictor v2", page_icon="🧠", layout="wide",
+st.set_page_config(page_title="Unified Fund Predictor", page_icon="🧠", layout="wide",
                    initial_sidebar_state="collapsed")
 
 st.markdown("""<style>
@@ -73,8 +56,16 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#fff!
 .pick-card .rank{font-size:1.6rem;font-weight:800;color:#1565c0}
 .pick-card .name{font-weight:700;color:#1E3A5F;font-size:.92rem}
 .pick-card .score{color:#4caf50;font-weight:700;font-size:.95rem}
-.fix-box{background:#e8f5e9;border-radius:10px;padding:12px 16px;margin:6px 0;border-left:4px solid #4caf50}
-.problem-box{background:#ffebee;border-radius:10px;padding:12px 16px;margin:6px 0;border-left:4px solid #f44336}
+.consensus-card{background:linear-gradient(135deg,#e8f5e9,#c8e6c9);border-radius:14px;padding:18px;margin:8px 0;
+  box-shadow:0 4px 15px rgba(0,0,0,.10);border-left:6px solid #2e7d32}
+.consensus-card .rank{font-size:1.8rem;font-weight:800;color:#2e7d32}
+.consensus-card .name{font-weight:700;color:#1b5e20;font-size:.95rem}
+.consensus-card .votes{color:#4caf50;font-weight:700;font-size:1rem}
+.vote-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:700;margin:1px}
+.vote-high{background:#4caf50;color:#fff}
+.vote-med{background:#ff9800;color:#fff}
+.vote-low{background:#e0e0e0;color:#666}
+.metric-box{background:#f5f7fa;border-radius:12px;padding:16px;margin:8px 0;border-left:5px solid #2196F3}
 </style>""", unsafe_allow_html=True)
 
 RISK_FREE_RATE = 0.06
@@ -87,13 +78,35 @@ FILE_MAP = {
     "Small Cap": "smallcap.xlsx", "Large & Mid Cap": "large_and_midcap_fund.xlsx",
     "Multi Cap": "MULTICAP.xlsx", "International": "international_merged.xlsx",
 }
-HOLD_PERIODS = [63, 126, 189, 252]
+HOLD_PERIODS = [63, 126, 189, 252, 378, 504, 630, 756]
+
+# All strategy names
+RULE_STRATEGIES = ["momentum","sharpe","sortino","regime_switch","stable_momentum",
+                   "elimination","consistency","smart_ensemble"]
+ML_STRATEGIES = ["graded_reg","return_reg","mlp_nn","pairwise","ml_ensemble"]
+ALL_STRATEGIES = RULE_STRATEGIES + ML_STRATEGIES
+
+STRATEGY_INFO = {
+    "momentum":        ("🚀 Composite Momentum", "Weighted multi-horizon returns / volatility"),
+    "sharpe":          ("⚖️ Sharpe Maximization", "Excess return per unit of total risk"),
+    "sortino":         ("🎯 Sortino Optimization", "Return per unit of downside risk"),
+    "regime_switch":   ("🚦 Regime Switch", "Momentum in bull, Sharpe in bear"),
+    "stable_momentum": ("⚓ Stable Momentum", "High momentum + low drawdown"),
+    "elimination":     ("🛡️ Elimination", "Remove worst DD & vol, pick best Sharpe"),
+    "consistency":     ("📈 Consistency", "Top half in 3/4 quarters, then momentum"),
+    "smart_ensemble":  ("🧠 Rule Ensemble", "7-strategy voting + vol-adj momentum"),
+    "graded_reg":      ("📊 Graded Regression", "ML: predict percentile rank (0-1)"),
+    "return_reg":      ("📈 Return Regression", "ML: predict forward return directly"),
+    "mlp_nn":          ("🔮 MLP Neural Net", "ML: 3-layer neural network on graded labels"),
+    "pairwise":        ("🔗 Pairwise Ranking", "ML: is fund A > fund B? Count wins"),
+    "ml_ensemble":     ("🧬 ML Ensemble", "ML: combine Graded+Return+MLP by rank"),
+}
 
 def hold_label(d):
     return f"{d}d (~{d//21}M)" if d < 252 else f"{d}d (~{d//252}Y)"
 
 # ============================================================================
-# 2. DATA LOADING (same structure as original)
+# 2. DATA LOADING
 # ============================================================================
 def is_growth_fund(name):
     n = str(name).lower()
@@ -152,26 +165,302 @@ def load_bench():
     except: return None
 
 # ============================================================================
-# 3. FEATURE ENGINEERING v2 — 42 features including temporal & relative
+# 3. CORE METRIC FUNCTIONS (from backtest_strategy.py)
+# ============================================================================
+def calc_sharpe(rets):
+    if len(rets) < 10 or rets.std() == 0: return np.nan
+    return ((rets - DAILY_RF).mean() / rets.std()) * np.sqrt(TRADING_DAYS)
+
+def calc_sortino(rets):
+    if len(rets) < 10: return np.nan
+    down = rets[rets < 0]
+    if len(down) < 3 or down.std() == 0: return np.nan
+    return ((rets - DAILY_RF).mean() / down.std()) * np.sqrt(TRADING_DAYS)
+
+def calc_vol(rets):
+    return rets.std() * np.sqrt(TRADING_DAYS) if len(rets) >= 10 else np.nan
+
+def calc_max_dd(series):
+    if len(series) < 10: return np.nan
+    c = (1 + series.pct_change().fillna(0)).cumprod()
+    return (c / c.expanding().max() - 1).min()
+
+def calc_cagr(series):
+    if len(series) < 30 or series.iloc[0] <= 0: return np.nan
+    yrs = (series.index[-1] - series.index[0]).days / 365.25
+    return (series.iloc[-1] / series.iloc[0]) ** (1/yrs) - 1 if yrs > 0 else np.nan
+
+def check_trend(series, w=50):
+    if len(series) < w + 5: return False
+    return series.iloc[-1] > series.iloc[-w:].mean()
+
+def check_dd_ok(series, thr=-0.10):
+    if len(series) < 20: return False
+    c = (1 + series.pct_change().fillna(0)).cumprod()
+    return (c.iloc[-1] / c.expanding().max().iloc[-1] - 1) > thr
+
+def adaptive_weights(hold):
+    if hold <= 63: return 0.60, 0.25, 0.15
+    elif hold <= 189: return 0.30, 0.45, 0.25
+    elif hold <= 378: return 0.20, 0.30, 0.50
+    else: return 0.15, 0.25, 0.60
+
+def calc_momentum(series, w3, w6, w12, risk_adj=True):
+    if len(series) < 260: return np.nan
+    cur, dt = series.iloc[-1], series.index[-1]
+    def past(d):
+        sub = series[series.index <= dt - pd.Timedelta(days=d)]
+        return sub.iloc[-1] if len(sub) > 0 else np.nan
+    p3, p6, p12 = past(91), past(182), past(365)
+    r3 = (cur/p3-1) if p3 else 0
+    r6 = (cur/p6-1) if p6 else 0
+    r12 = (cur/p12-1) if p12 else 0
+    score = r3*w3 + r6*w6 + r12*w12
+    if risk_adj:
+        vol = series.iloc[-252:].pct_change().dropna().std() * np.sqrt(252) if len(series) >= 252 else np.nan
+        return score/vol if vol and vol > 0 else np.nan
+    return score
+
+def vol_adj_mom(series, w3=0.33, w6=0.33, w12=0.34):
+    return calc_momentum(series, w3, w6, w12, risk_adj=True)
+
+def get_regime(bench, date):
+    sub = bench[bench.index <= date]
+    return 'bull' if len(sub) >= 200 and sub.iloc[-1] > sub.iloc[-200:].mean() else 'bear'
+
+# ============================================================================
+# 4. RULE-BASED BACKTESTER (from backtest_strategy.py — all 8 strategies)
+# ============================================================================
+def run_rule_backtest(nav, strategy, top_n, target_n, hold_days, bench, smap):
+    """Run a single rule-based strategy backtest. Returns results_df, equity, benchmark, trades."""
+    start = nav.index.min() + pd.Timedelta(days=370)
+    if start >= nav.index.max():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    start_idx = nav.index.searchsorted(start)
+    rebal = list(range(start_idx, len(nav)-1, hold_days))
+    if not rebal:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    w3a, w6a, w12a = adaptive_weights(hold_days)
+    history, trades = [], []
+    eq = [{"date": nav.index[rebal[0]], "value": 100.0}]
+    bm = [{"date": nav.index[rebal[0]], "value": 100.0}]
+    cap, bcap = 100.0, 100.0
+
+    for i in rebal:
+        dt = nav.index[i]
+        entry_i = i + 1
+        exit_i = min(i + 1 + hold_days, len(nav) - 1)
+        entry_dt, exit_dt = nav.index[entry_i], nav.index[exit_i]
+        hist = nav[(nav.index >= dt - pd.Timedelta(days=400)) & (nav.index < dt)]
+
+        scores = {}
+        for col in nav.columns:
+            fh = hist[col].dropna()
+            if len(fh) < 126: continue
+            rets = fh.pct_change().dropna()
+            if strategy == "momentum":
+                sc = calc_momentum(fh, w3a, w6a, w12a, True)
+            elif strategy == "sharpe":
+                sc = calc_sharpe(rets)
+            elif strategy == "sortino":
+                sc = calc_sortino(rets)
+            elif strategy == "regime_switch":
+                r = get_regime(bench, dt) if bench is not None else "bull"
+                sc = calc_momentum(fh, 0.3, 0.3, 0.4, False) if r == "bull" else calc_sharpe(rets)
+            else:
+                sc = calc_sharpe(rets)
+            if pd.isna(sc): continue
+            full_s = nav[col].dropna()
+            full_s = full_s[full_s.index <= dt]
+            scores[col] = {
+                "score": sc, "sharpe": calc_sharpe(rets), "sortino": calc_sortino(rets),
+                "vol": calc_vol(rets), "dd": calc_max_dd(fh),
+                "vol_adj_mom": vol_adj_mom(fh, w3a, w6a, w12a),
+            }
+
+        # Selection logic per strategy
+        selected = []
+        if strategy == "smart_ensemble":
+            base_picks = {}
+            for bs in ["momentum","sharpe","sortino","stable_momentum","elimination","consistency","regime_switch"]:
+                if bs == "momentum":
+                    ranked = sorted(scores.items(), key=lambda x: (x[1].get("vol_adj_mom") or 0), reverse=True)
+                elif bs == "sharpe":
+                    ranked = sorted(scores.items(), key=lambda x: (x[1]["sharpe"] or 0), reverse=True)
+                elif bs == "sortino":
+                    ranked = sorted(scores.items(), key=lambda x: (x[1]["sortino"] or 0), reverse=True)
+                elif bs == "stable_momentum":
+                    pool = sorted(scores.items(), key=lambda x: (x[1].get("vol_adj_mom") or 0), reverse=True)[:top_n*2]
+                    ranked = sorted(pool, key=lambda x: (x[1]["dd"] if x[1]["dd"] is not None else -999), reverse=True)
+                elif bs == "elimination":
+                    dfs = pd.DataFrame(scores).T
+                    if len(dfs) > top_n*2: dfs = dfs[dfs["dd"] >= dfs["dd"].quantile(0.25)]
+                    if len(dfs) > top_n*2: dfs = dfs[dfs["vol"] <= dfs["vol"].quantile(0.75)]
+                    ranked = [(idx, scores.get(idx, {})) for idx in dfs.sort_values("sharpe", ascending=False).index] if len(dfs) > 0 else []
+                elif bs == "regime_switch":
+                    r = get_regime(bench, dt) if bench is not None else "bull"
+                    ranked = sorted(scores.items(), key=lambda x: (x[1].get("vol_adj_mom") or 0), reverse=True) if r == "bull" else sorted(scores.items(), key=lambda x: (x[1]["sharpe"] or 0), reverse=True)
+                else:
+                    ranked = sorted(scores.items(), key=lambda x: (x[1]["sharpe"] or 0), reverse=True)
+                base_picks[bs] = [f for f, _ in ranked[:top_n]]
+            vm = {}
+            for sn, pks in base_picks.items():
+                for fid in pks: vm[fid] = vm.get(fid, 0) + 1
+            cands = [(fid, vm[fid], scores.get(fid, {})) for fid in vm]
+            cands.sort(key=lambda x: (-x[1], -(x[2].get("vol_adj_mom") or 0)))
+            selected = [c[0] for c in cands[:top_n]]
+        elif strategy == "stable_momentum":
+            pool = [f for f, _ in sorted(scores.items(), key=lambda x: (x[1]["score"], x[1]["sharpe"] or 0), reverse=True)[:top_n*2]]
+            pool_dd = [(f, scores[f]["dd"]) for f in pool if scores[f]["dd"] is not None]
+            selected = [f for f, _ in sorted(pool_dd, key=lambda x: x[1], reverse=True)[:top_n]]
+        elif strategy == "elimination":
+            dfs = pd.DataFrame(scores).T
+            if len(dfs) > top_n*2: dfs = dfs[dfs["dd"] >= dfs["dd"].quantile(0.25)]
+            if len(dfs) > top_n*2: dfs = dfs[dfs["vol"] <= dfs["vol"].quantile(0.75)]
+            if len(dfs) > 0:
+                selected = dfs.sort_values(["sharpe","score"], ascending=[False,False]).head(top_n).index.tolist()
+        elif strategy == "consistency":
+            cons = []
+            for col in scores:
+                fh = hist[col].dropna()
+                if len(fh) < 300: continue
+                good = 0
+                for q in range(4):
+                    try:
+                        qs = dt - pd.Timedelta(days=(q+1)*91)
+                        qe = dt - pd.Timedelta(days=q*91)
+                        is_ = hist.index.asof(qs); ie = hist.index.asof(qe)
+                        if pd.isna(is_) or pd.isna(ie): continue
+                        all_r = {}
+                        for f in scores:
+                            fd = hist[f].dropna()
+                            if len(fd) > 0:
+                                v_e = fd[fd.index <= ie]
+                                v_s = fd[fd.index <= is_]
+                                if len(v_e) > 0 and len(v_s) > 0:
+                                    all_r[f] = v_e.iloc[-1] / v_s.iloc[-1] - 1
+                        if col in all_r and all_r[col] >= np.median(list(all_r.values())):
+                            good += 1
+                    except: continue
+                if good >= 3: cons.append(col)
+            if cons:
+                selected = [f for f, _ in sorted([(f, scores[f]["score"]) for f in cons], key=lambda x: x[1], reverse=True)[:top_n]]
+            else:
+                selected = [f for f, _ in sorted(scores.items(), key=lambda x: (x[1]["score"], x[1]["sharpe"] or 0), reverse=True)[:top_n]]
+        else:
+            selected = [f for f, _ in sorted(scores.items(), key=lambda x: (x[1]["score"], x[1]["sharpe"] or 0), reverse=True)[:top_n]]
+
+        # Compute actual returns
+        rets_map = {}
+        for fid in scores:
+            try:
+                en = nav.loc[entry_dt, fid] if entry_dt in nav.index else np.nan
+                ex = nav.loc[exit_dt, fid] if exit_dt in nav.index else np.nan
+                if pd.isna(en) or pd.isna(ex):
+                    fd = nav[fid].dropna()
+                    en = fd[fd.index <= entry_dt].iloc[-1] if len(fd[fd.index <= entry_dt]) > 0 else np.nan
+                    ex = fd[fd.index <= exit_dt].iloc[-1] if len(fd[fd.index <= exit_dt]) > 0 else np.nan
+                if not pd.isna(en) and not pd.isna(ex): rets_map[fid] = ex/en - 1
+            except: continue
+
+        valid = {k: v for k, v in rets_map.items() if not pd.isna(v)}
+        actual_top = [f for f, _ in sorted(valid.items(), key=lambda x: x[1], reverse=True)[:target_n]]
+        sel_valid = [f for f in selected if f in valid]
+        hits = len(set(sel_valid) & set(actual_top))
+        hr = hits / len(sel_valid) if sel_valid else 0
+        pret = np.mean([valid[f] for f in sel_valid]) if sel_valid else 0
+        bret = (bench.asof(exit_dt) / bench.asof(entry_dt) - 1) if bench is not None else 0
+
+        cap *= (1 + pret); bcap *= (1 + bret)
+
+        rec = {"Start": dt.strftime("%Y-%m-%d"), "End": exit_dt.strftime("%Y-%m-%d"),
+               "Pool": len(scores), "Port %": pret*100, "Bench %": bret*100,
+               "Alpha %": (pret-bret)*100, "Hits": hits, "HR %": hr*100}
+        for j, fid in enumerate(selected):
+            rec[f"Pick{j+1}"] = smap.get(fid, fid)[:35]
+            rec[f"Pick{j+1}%"] = valid.get(fid, np.nan)*100 if fid in valid else np.nan
+            rec[f"Pick{j+1}Hit"] = "✅" if fid in actual_top else "❌"
+        trades.append(rec)
+        history.append({"date": dt, "selected": selected, "return": pret, "hit_rate": hr})
+        eq.append({"date": exit_dt, "value": cap})
+        bm.append({"date": exit_dt, "value": bcap})
+
+    return pd.DataFrame(history), pd.DataFrame(eq), pd.DataFrame(bm), pd.DataFrame(trades)
+
+
+def get_rule_current_picks(nav, smap, bench, strategy, top_n, hold):
+    """Get current picks for a rule-based strategy (what to buy today)."""
+    dt = nav.index.max()
+    hist = nav[(nav.index >= dt - pd.Timedelta(days=400)) & (nav.index <= dt)]
+    w3, w6, w12 = adaptive_weights(hold)
+
+    scores = {}
+    for col in nav.columns:
+        fh = hist[col].dropna()
+        if len(fh) < 126: continue
+        rets = fh.pct_change().dropna()
+        if strategy == "momentum": sc = vol_adj_mom(fh, w3, w6, w12)
+        elif strategy == "sharpe": sc = calc_sharpe(rets)
+        elif strategy == "sortino": sc = calc_sortino(rets)
+        elif strategy == "regime_switch":
+            r = get_regime(bench, dt) if bench is not None else "bull"
+            sc = calc_momentum(fh, 0.3, 0.3, 0.4, False) if r == "bull" else calc_sharpe(rets)
+        else: sc = calc_sharpe(rets)
+        if pd.isna(sc): continue
+        full_s = nav[col].dropna()
+        scores[col] = {
+            "score": sc, "sharpe": calc_sharpe(rets), "sortino": calc_sortino(rets),
+            "vol": calc_vol(rets), "dd": calc_max_dd(fh),
+            "vol_adj_mom": vol_adj_mom(fh, w3, w6, w12),
+            "ret_3m": (fh.iloc[-1]/fh.iloc[-63]-1)*100 if len(fh) >= 63 else np.nan,
+            "ret_1y": (fh.iloc[-1]/fh.iloc[-252]-1)*100 if len(fh) >= 252 else np.nan,
+        }
+
+    if not scores: return []
+
+    if strategy == "stable_momentum":
+        pool = [f for f, _ in sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:top_n*2]]
+        pool_dd = [(f, scores[f]["dd"]) for f in pool if scores[f]["dd"] is not None]
+        selected = [f for f, _ in sorted(pool_dd, key=lambda x: x[1], reverse=True)[:top_n]]
+    elif strategy == "elimination":
+        dfs = pd.DataFrame(scores).T
+        if len(dfs) > top_n*2: dfs = dfs[dfs["dd"] >= dfs["dd"].quantile(0.25)]
+        if len(dfs) > top_n*2: dfs = dfs[dfs["vol"] <= dfs["vol"].quantile(0.75)]
+        selected = dfs.sort_values("sharpe", ascending=False).head(top_n).index.tolist() if len(dfs) > 0 else []
+    elif strategy == "smart_ensemble":
+        base_strats = ["momentum","sharpe","sortino","stable_momentum","elimination","consistency","regime_switch"]
+        vm = {}
+        for bs in base_strats:
+            bpicks = get_rule_current_picks(nav, smap, bench, bs, top_n, hold)
+            for p in bpicks:
+                fid = p["fund_id"]
+                vm[fid] = vm.get(fid, 0) + 1
+        cands = [(fid, vm[fid], scores.get(fid, {}).get("vol_adj_mom", 0) or 0) for fid in vm if fid in scores]
+        cands.sort(key=lambda x: (-x[1], -x[2]))
+        selected = [c[0] for c in cands[:top_n]]
+    elif strategy == "consistency":
+        # Simplified: use consistency_qtrs-like logic
+        selected = [f for f, _ in sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:top_n]]
+    else:
+        selected = [f for f, _ in sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)[:top_n]]
+
+    return [{"fund_id": fid, "name": smap.get(fid, fid), **scores.get(fid, {})} for fid in selected if fid in scores]
+
+# ============================================================================
+# 5. ML FEATURE ENGINE (42 features from v2)
 # ============================================================================
 FEATURE_COLS = [
-    # Momentum (8)
     "ret_5d","ret_21d","ret_63d","ret_126d","ret_252d",
     "mom_accel_21","mom_accel_63","ret_63d_div_ret_252d",
-    # Risk (6)
     "vol_21d","vol_63d","vol_252d","max_dd_63d","max_dd_126d","max_dd_252d",
-    # Risk-adjusted (6)
     "sharpe_63d","sharpe_126d","sharpe_252d","sortino_63d","sortino_126d","sortino_252d",
-    # Trend (6)
     "above_20dma","above_50dma","above_200dma",
     "dist_from_peak_63","dist_from_peak_252","mean_reversion_63d",
-    # Stability (4)
     "vol_of_vol_63d","up_down_ratio_63d","pos_day_pct_63d","consistency_qtrs",
-    # Cross-sectional (8) — KEY FOR RANKING
     "cs_pctile_ret21","cs_pctile_ret63","cs_pctile_ret252",
     "cs_z_ret63","cs_z_ret252",
     "cs_pctile_sharpe63","cs_pctile_vol63","cs_rank_composite",
-    # Regime (4)
     "bench_ret_63d","bench_vol_63d","bench_above_50dma","bench_above_200dma",
 ]
 
@@ -203,12 +492,9 @@ def safe_sortino(s, n):
     if len(d) < 3 or d.std() == 0: return np.nan
     return ((r - DAILY_RF).mean() / d.std()) * np.sqrt(TRADING_DAYS)
 
-def extract_features(nav_df, bench, date_idx, min_hist=260):
-    """Extract features for ALL funds at a single date. Returns DataFrame."""
+def extract_ml_features(nav_df, bench, date_idx, min_hist=260):
+    """Extract 42 ML features for ALL funds at a single date index."""
     records = []
-    fund_cols = nav_df.columns.tolist()
-    
-    # Regime features (shared)
     regime = {}
     if bench is not None:
         b = bench.iloc[:date_idx+1].dropna()
@@ -219,552 +505,366 @@ def extract_features(nav_df, bench, date_idx, min_hist=260):
     else:
         regime = {"bench_ret_63d":0,"bench_vol_63d":0,"bench_above_50dma":0.5,"bench_above_200dma":0.5}
 
-    for col in fund_cols:
+    for col in nav_df.columns:
         s = nav_df[col].iloc[:date_idx+1].dropna()
         if len(s) < min_hist: continue
-        
         f = {"fund_id": col}
-        
-        # Momentum
         f["ret_5d"] = safe_ret(s, 5)
         f["ret_21d"] = safe_ret(s, 21)
         f["ret_63d"] = safe_ret(s, 63)
         f["ret_126d"] = safe_ret(s, 126)
         f["ret_252d"] = safe_ret(s, 252)
-        # Acceleration
-        r21_now = f["ret_21d"] or 0
-        if len(s) > 42:
-            r21_prev = safe_ret(s.iloc[:-21], 21) or 0
-            f["mom_accel_21"] = r21_now - r21_prev
-        else: f["mom_accel_21"] = 0
-        r63_now = f["ret_63d"] or 0
-        if len(s) > 126:
-            r63_prev = safe_ret(s.iloc[:-63], 63) or 0
-            f["mom_accel_63"] = r63_now - r63_prev
-        else: f["mom_accel_63"] = 0
-        # Momentum ratio (short vs long)
+        r21 = f["ret_21d"] or 0
+        f["mom_accel_21"] = (r21 - (safe_ret(s.iloc[:-21], 21) or 0)) if len(s) > 42 else 0
+        r63 = f["ret_63d"] or 0
+        f["mom_accel_63"] = (r63 - (safe_ret(s.iloc[:-63], 63) or 0)) if len(s) > 126 else 0
         r252 = f["ret_252d"]
-        f["ret_63d_div_ret_252d"] = (f["ret_63d"] / r252) if r252 and r252 != 0 and f["ret_63d"] else 0
-        
-        # Risk
+        f["ret_63d_div_ret_252d"] = (f["ret_63d"]/r252) if r252 and r252 != 0 and f["ret_63d"] else 0
         f["vol_21d"] = safe_vol(s, 21)
         f["vol_63d"] = safe_vol(s, 63)
         f["vol_252d"] = safe_vol(s, 252)
         f["max_dd_63d"] = safe_dd(s, 63)
         f["max_dd_126d"] = safe_dd(s, 126)
         f["max_dd_252d"] = safe_dd(s, 252)
-        
-        # Risk-adjusted
         f["sharpe_63d"] = safe_sharpe(s, 63)
         f["sharpe_126d"] = safe_sharpe(s, 126)
         f["sharpe_252d"] = safe_sharpe(s, 252)
         f["sortino_63d"] = safe_sortino(s, 63)
         f["sortino_126d"] = safe_sortino(s, 126)
         f["sortino_252d"] = safe_sortino(s, 252)
-        
-        # Trend
         cur = s.iloc[-1]
         f["above_20dma"] = float(cur > s.iloc[-20:].mean()) if len(s) >= 20 else 0.5
         f["above_50dma"] = float(cur > s.iloc[-50:].mean()) if len(s) >= 50 else 0.5
         f["above_200dma"] = float(cur > s.iloc[-200:].mean()) if len(s) >= 200 else 0.5
-        peak63 = s.iloc[-63:].max() if len(s) >= 63 else s.max()
-        peak252 = s.iloc[-252:].max() if len(s) >= 252 else s.max()
-        f["dist_from_peak_63"] = (cur/peak63 - 1) if peak63 > 0 else 0
-        f["dist_from_peak_252"] = (cur/peak252 - 1) if peak252 > 0 else 0
+        pk63 = s.iloc[-63:].max() if len(s) >= 63 else s.max()
+        pk252 = s.iloc[-252:].max() if len(s) >= 252 else s.max()
+        f["dist_from_peak_63"] = (cur/pk63 - 1) if pk63 > 0 else 0
+        f["dist_from_peak_252"] = (cur/pk252 - 1) if pk252 > 0 else 0
         f["mean_reversion_63d"] = (cur / s.iloc[-63:].mean() - 1) if len(s) >= 63 else 0
-        
-        # Stability
         if len(s) >= 63:
             rets = s.iloc[-63:].pct_change().dropna()
-            roll_vol = rets.rolling(10).std()
-            f["vol_of_vol_63d"] = roll_vol.std() if len(roll_vol.dropna()) > 5 else np.nan
-            up = (rets > 0).sum(); down = (rets < 0).sum()
-            f["up_down_ratio_63d"] = up / down if down > 0 else 2.0
-            f["pos_day_pct_63d"] = up / len(rets)
+            rv = rets.rolling(10).std()
+            f["vol_of_vol_63d"] = rv.std() if len(rv.dropna()) > 5 else np.nan
+            up = (rets > 0).sum(); dn = (rets < 0).sum()
+            f["up_down_ratio_63d"] = up/dn if dn > 0 else 2.0
+            f["pos_day_pct_63d"] = up/len(rets)
         else:
-            f["vol_of_vol_63d"] = np.nan
-            f["up_down_ratio_63d"] = 1.0
-            f["pos_day_pct_63d"] = 0.5
-        
-        # Quarterly consistency (how many of last 4 qtrs in top half)
-        good_qtrs = 0
+            f["vol_of_vol_63d"] = np.nan; f["up_down_ratio_63d"] = 1.0; f["pos_day_pct_63d"] = 0.5
+        gq = 0
         if len(s) >= 252:
             for q in range(4):
                 qs = -(q+1)*63; qe = -q*63 if q > 0 else None
-                qret = (s.iloc[qe] / s.iloc[qs] - 1) if qe else (s.iloc[-1] / s.iloc[qs] - 1)
-                if not pd.isna(qret) and qret > 0: good_qtrs += 1
-        f["consistency_qtrs"] = good_qtrs / 4
-        
-        # Regime
+                qr = (s.iloc[qe]/s.iloc[qs]-1) if qe else (s.iloc[-1]/s.iloc[qs]-1)
+                if not pd.isna(qr) and qr > 0: gq += 1
+        f["consistency_qtrs"] = gq/4
         f.update(regime)
-        
         records.append(f)
-    
+
     if not records: return pd.DataFrame()
     df = pd.DataFrame(records)
-    
-    # Cross-sectional features (computed across all funds at this date)
-    for col_name, src_col in [
-        ("cs_pctile_ret21","ret_21d"), ("cs_pctile_ret63","ret_63d"),
-        ("cs_pctile_ret252","ret_252d"), ("cs_pctile_sharpe63","sharpe_63d"),
-        ("cs_pctile_vol63","vol_63d"),
-    ]:
-        vals = df[src_col].values
+
+    # Cross-sectional features
+    for cn, sc in [("cs_pctile_ret21","ret_21d"),("cs_pctile_ret63","ret_63d"),
+                   ("cs_pctile_ret252","ret_252d"),("cs_pctile_sharpe63","sharpe_63d"),
+                   ("cs_pctile_vol63","vol_63d")]:
+        vals = df[sc].values
         valid = ~np.isnan(vals)
-        result = np.full(len(vals), 0.5)
+        res = np.full(len(vals), 0.5)
         if valid.sum() > 2:
             ranks = np.zeros(len(vals))
             ranks[valid] = rankdata(vals[valid]) / valid.sum()
-            result = ranks
-        df[col_name] = result
-    
-    for col_name, src_col in [("cs_z_ret63","ret_63d"),("cs_z_ret252","ret_252d")]:
-        vals = df[src_col].values
-        valid = ~np.isnan(vals)
-        result = np.zeros(len(vals))
+            res = ranks
+        df[cn] = res
+    for cn, sc in [("cs_z_ret63","ret_63d"),("cs_z_ret252","ret_252d")]:
+        vals = df[sc].values; valid = ~np.isnan(vals)
+        res = np.zeros(len(vals))
         if valid.sum() > 2:
             m, s = np.nanmean(vals[valid]), np.nanstd(vals[valid])
-            if s > 0: result[valid] = (vals[valid] - m) / s
-        df[col_name] = result
-    
-    # Composite rank (average of percentile ranks)
-    pctile_cols = [c for c in df.columns if c.startswith("cs_pctile_")]
-    df["cs_rank_composite"] = df[pctile_cols].mean(axis=1)
-    
+            if s > 0: res[valid] = (vals[valid]-m)/s
+        df[cn] = res
+    pctcols = [c for c in df.columns if c.startswith("cs_pctile_")]
+    df["cs_rank_composite"] = df[pctcols].mean(axis=1)
     return df
 
+
 # ============================================================================
-# 4. DATASET BUILDING — with GRADED LABELS (key fix)
+# 6. ML DATASET BUILDING
 # ============================================================================
-def build_dataset(nav_df, bench, smap, hold_days, top_k,
-                  step_days=21, min_hist=370):
-    """
-    KEY DIFFERENCE FROM v1:
-    - step_days=21 (monthly sliding) → 5-10x more training data
-    - Labels are GRADED: percentile rank of forward return (0-1)
-    - Also store binary label for hit rate computation
-    """
+def build_ml_dataset(nav_df, bench, smap, hold_days, top_k, step_days=21, min_hist=370):
     start_idx = nav_df.index.searchsorted(nav_df.index.min() + pd.Timedelta(days=min_hist))
     end_idx = len(nav_df) - hold_days - 1
     rebal = list(range(start_idx, end_idx, step_days))
-    
-    all_records = []
-    prog = st.progress(0, text="Building dataset...")
-    
+    all_recs = []
+    prog = st.progress(0, "Building ML dataset...")
     for pi, idx in enumerate(rebal):
         if pi % 10 == 0:
-            prog.progress(pi / len(rebal), text=f"Date {pi+1}/{len(rebal)}...")
-        
-        signal_dt = nav_df.index[idx]
-        entry_idx = idx + 1
-        exit_idx = min(idx + 1 + hold_days, len(nav_df) - 1)
-        entry_dt = nav_df.index[entry_idx]
-        exit_dt = nav_df.index[exit_idx]
-        
-        snap = extract_features(nav_df, bench, idx)
+            prog.progress(pi/len(rebal), f"Date {pi+1}/{len(rebal)}...")
+        sig_dt = nav_df.index[idx]
+        ent_idx = idx + 1
+        ext_idx = min(idx+1+hold_days, len(nav_df)-1)
+        ent_dt = nav_df.index[ent_idx]
+        ext_dt = nav_df.index[ext_idx]
+        snap = extract_ml_features(nav_df, bench, idx)
         if len(snap) < top_k + 3: continue
-        
-        # Forward returns
         fwd = {}
         for fid in snap["fund_id"]:
             try:
-                en = nav_df.loc[entry_dt, fid]
-                ex = nav_df.loc[exit_dt, fid]
-                if pd.notna(en) and pd.notna(ex) and en > 0:
-                    fwd[fid] = ex / en - 1
+                en = nav_df.loc[ent_dt, fid]; ex = nav_df.loc[ext_dt, fid]
+                if pd.notna(en) and pd.notna(ex) and en > 0: fwd[fid] = ex/en-1
             except: continue
-        
         if len(fwd) < top_k + 3: continue
-        
-        # GRADED LABEL: percentile rank of forward return
-        fwd_series = pd.Series(fwd)
-        fwd_ranks = rankdata(fwd_series.values) / len(fwd_series)  # 0 to 1
-        rank_map = dict(zip(fwd_series.index, fwd_ranks))
-        
-        # Binary: top_k
-        sorted_fwd = fwd_series.sort_values(ascending=False)
-        top_k_set = set(sorted_fwd.index[:top_k])
-        
-        # Benchmark return
+        fwd_s = pd.Series(fwd)
+        fwd_ranks = rankdata(fwd_s.values)/len(fwd_s)
+        rmap = dict(zip(fwd_s.index, fwd_ranks))
+        topk_set = set(fwd_s.sort_values(ascending=False).index[:top_k])
         bret = 0
         if bench is not None:
-            try:
-                bret = bench.asof(exit_dt) / bench.asof(entry_dt) - 1
+            try: bret = bench.asof(ext_dt)/bench.asof(ent_dt)-1
             except: pass
-        
         for _, row in snap.iterrows():
             fid = row["fund_id"]
             if fid not in fwd: continue
             rec = row.to_dict()
-            rec["signal_date"] = signal_dt
-            rec["entry_date"] = entry_dt
-            rec["exit_date"] = exit_dt
-            rec["forward_return"] = fwd[fid]
-            rec["graded_label"] = rank_map[fid]  # 0-1 percentile rank
-            rec["binary_label"] = 1 if fid in top_k_set else 0
-            rec["bench_return"] = bret
-            rec["fund_name"] = smap.get(fid, fid)
-            all_records.append(rec)
-    
+            rec.update({"signal_date": sig_dt, "entry_date": ent_dt, "exit_date": ext_dt,
+                        "forward_return": fwd[fid], "graded_label": rmap[fid],
+                        "binary_label": 1 if fid in topk_set else 0,
+                        "bench_return": bret, "fund_name": smap.get(fid, fid)})
+            all_recs.append(rec)
     prog.empty()
-    return pd.DataFrame(all_records)
+    return pd.DataFrame(all_recs)
 
 
 # ============================================================================
-# 5. MODELS — Three approaches that directly optimize ranking
+# 7. ML MODELS (5 strategies from v2)
 # ============================================================================
+class GradedRegModel:
+    name = "graded_reg"
+    def __init__(self):
+        self.model = HistGradientBoostingRegressor(
+            max_iter=300, max_depth=5, learning_rate=0.03,
+            min_samples_leaf=20, l2_regularization=1.5,
+            early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=30, random_state=42)
+    def train(self, df):
+        X = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median()).fillna(0)
+        self.model.fit(X, df["graded_label"].values); return True
+    def predict_scores(self, snap):
+        X = snap[FEATURE_COLS].fillna(snap[FEATURE_COLS].median()).fillna(0)
+        return self.model.predict(X)
 
-class PairwiseRankModel:
-    """
-    Strategy 1: PAIRWISE RANKING
-    
-    For each pair of funds at each date, predict which has higher return.
-    At test time, count pairwise "wins" → rank by wins → pick top K.
-    
-    This directly optimizes the ranking question.
-    """
+class ReturnRegModel:
+    name = "return_reg"
+    def __init__(self):
+        self.model = HistGradientBoostingRegressor(
+            max_iter=300, max_depth=5, learning_rate=0.03,
+            min_samples_leaf=20, l2_regularization=1.5,
+            early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=30, random_state=42)
+    def train(self, df):
+        X = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median()).fillna(0)
+        y = np.clip(df["forward_return"].values, *np.percentile(df["forward_return"], [2,98]))
+        self.model.fit(X, y); return True
+    def predict_scores(self, snap):
+        X = snap[FEATURE_COLS].fillna(snap[FEATURE_COLS].median()).fillna(0)
+        return self.model.predict(X)
+
+class MLPModel:
+    name = "mlp_nn"
+    def __init__(self):
+        self.model = MLPRegressor(hidden_layer_sizes=(128,64,32), activation="relu",
+            solver="adam", alpha=0.005, learning_rate="adaptive", max_iter=500,
+            early_stopping=True, validation_fraction=0.15, n_iter_no_change=30, random_state=42)
+        self.scaler = RobustScaler()
+    def train(self, df):
+        X = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median()).fillna(0)
+        self.scaler.fit(X)
+        self.model.fit(self.scaler.transform(X), df["graded_label"].values); return True
+    def predict_scores(self, snap):
+        X = snap[FEATURE_COLS].fillna(snap[FEATURE_COLS].median()).fillna(0)
+        return self.model.predict(self.scaler.transform(X))
+
+class PairwiseModel:
+    name = "pairwise"
     def __init__(self):
         self.model = HistGradientBoostingClassifier(
             max_iter=200, max_depth=4, learning_rate=0.05,
             min_samples_leaf=30, l2_regularization=2.0,
-            early_stopping=True, validation_fraction=0.15,
-            n_iter_no_change=25, random_state=42,
-        )
+            early_stopping=True, validation_fraction=0.15, random_state=42)
         self.scaler = RobustScaler()
-        self.feature_cols = FEATURE_COLS
-    
-    def _make_pairs(self, df, max_pairs_per_date=500):
-        """Generate pairwise training samples from a snapshot."""
-        pairs_X, pairs_y = [], []
-        dates = df["signal_date"].unique()
-        
-        for dt in dates:
-            snap = df[df["signal_date"] == dt]
+    def train(self, df, max_pairs=500):
+        pX, py = [], []
+        for dt in df["signal_date"].unique():
+            snap = df[df["signal_date"]==dt]
             if len(snap) < 5: continue
-            
-            fids = snap["fund_id"].values
-            feats = snap[self.feature_cols].fillna(0).values
+            feats = snap[FEATURE_COLS].fillna(0).values
             fwd = snap["forward_return"].values
-            
-            n = len(fids)
-            # Sample pairs (not all N*N — too many)
-            n_pairs = min(max_pairs_per_date, n * (n - 1) // 2)
-            indices = np.random.choice(n, size=(n_pairs, 2), replace=True)
-            # Remove self-pairs
-            mask = indices[:, 0] != indices[:, 1]
-            indices = indices[mask]
-            
-            for i, j in indices:
-                diff = feats[i] - feats[j]  # Feature difference
-                if fwd[i] > fwd[j]:
-                    pairs_X.append(diff)
-                    pairs_y.append(1)
-                elif fwd[j] > fwd[i]:
-                    pairs_X.append(diff)
-                    pairs_y.append(0)
-        
-        return np.array(pairs_X), np.array(pairs_y)
-    
-    def train(self, train_df):
-        X, y = self._make_pairs(train_df)
-        if len(X) < 50: return False
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        return True
-    
-    def predict_scores(self, test_snap):
-        """Score each fund by pairwise win count."""
-        feats = test_snap[self.feature_cols].fillna(0).values
-        n = len(feats)
-        wins = np.zeros(n)
-        
+            n = len(feats)
+            idxs = np.random.choice(n, size=(min(max_pairs, n*(n-1)//2), 2), replace=True)
+            for i, j in idxs:
+                if i == j: continue
+                d = feats[i] - feats[j]
+                if fwd[i] > fwd[j]: pX.append(d); py.append(1)
+                elif fwd[j] > fwd[i]: pX.append(d); py.append(0)
+        if len(pX) < 50: return False
+        self.scaler.fit(np.array(pX))
+        self.model.fit(self.scaler.transform(np.array(pX)), np.array(py)); return True
+    def predict_scores(self, snap):
+        feats = snap[FEATURE_COLS].fillna(0).values
+        n = len(feats); wins = np.zeros(n)
         for i in range(n):
             for j in range(n):
                 if i == j: continue
-                diff = (feats[i] - feats[j]).reshape(1, -1)
-                diff_scaled = self.scaler.transform(diff)
-                prob = self.model.predict_proba(diff_scaled)[0]
-                wins[i] += prob[1] if len(prob) > 1 else prob[0]
-        
-        return wins / max(n - 1, 1)  # Normalize
+                d = self.scaler.transform((feats[i]-feats[j]).reshape(1,-1))
+                p = self.model.predict_proba(d)[0]
+                wins[i] += p[1] if len(p) > 1 else p[0]
+        return wins / max(n-1, 1)
 
-
-class GradedRegressionModel:
-    """
-    Strategy 2: REGRESSION ON GRADED LABELS
-    
-    Instead of binary classification, predict the percentile rank (0-1).
-    Fund ranked #1 gets label ~1.0, #50 gets ~0.02.
-    
-    This preserves ordinal information that binary labels destroy.
-    """
+class MLEnsembleModel:
+    name = "ml_ensemble"
     def __init__(self):
-        self.model = HistGradientBoostingRegressor(
-            max_iter=300, max_depth=5, learning_rate=0.03,
-            min_samples_leaf=20, l2_regularization=1.5,
-            early_stopping=True, validation_fraction=0.15,
-            n_iter_no_change=30, random_state=42,
-        )
-        self.feature_cols = FEATURE_COLS
-    
-    def train(self, train_df):
-        X = train_df[self.feature_cols].fillna(train_df[self.feature_cols].median()).fillna(0)
-        y = train_df["graded_label"].values
-        self.model.fit(X, y)
-        return True
-    
-    def predict_scores(self, test_snap):
-        X = test_snap[self.feature_cols].fillna(test_snap[self.feature_cols].median()).fillna(0)
-        return self.model.predict(X)
+        self.g = GradedRegModel(); self.r = ReturnRegModel(); self.m = MLPModel()
+    def train(self, df):
+        self.g.train(df); self.r.train(df); self.m.train(df); return True
+    def predict_scores(self, snap):
+        s1 = self.g.predict_scores(snap)
+        s2 = self.r.predict_scores(snap)
+        s3 = self.m.predict_scores(snap)
+        rn = lambda a: rankdata(a)/len(a)
+        return 0.4*rn(s1) + 0.35*rn(s2) + 0.25*rn(s3)
 
-
-class ReturnRegressionModel:
-    """
-    Strategy 3: DIRECT RETURN PREDICTION
-    
-    Predict the actual forward return. Simpler but effective baseline.
-    """
-    def __init__(self):
-        self.model = HistGradientBoostingRegressor(
-            max_iter=300, max_depth=5, learning_rate=0.03,
-            min_samples_leaf=20, l2_regularization=1.5,
-            early_stopping=True, validation_fraction=0.15,
-            n_iter_no_change=30, random_state=42,
-        )
-        self.feature_cols = FEATURE_COLS
-    
-    def train(self, train_df):
-        X = train_df[self.feature_cols].fillna(train_df[self.feature_cols].median()).fillna(0)
-        y = train_df["forward_return"].values
-        # Winsorize extreme returns
-        y = np.clip(y, np.percentile(y, 2), np.percentile(y, 98))
-        self.model.fit(X, y)
-        return True
-    
-    def predict_scores(self, test_snap):
-        X = test_snap[self.feature_cols].fillna(test_snap[self.feature_cols].median()).fillna(0)
-        return self.model.predict(X)
-
-
-class MLPRankModel:
-    """
-    Strategy 4: NEURAL NETWORK with graded regression
-    """
-    def __init__(self):
-        self.model = MLPRegressor(
-            hidden_layer_sizes=(128, 64, 32),
-            activation="relu", solver="adam", alpha=0.005,
-            learning_rate="adaptive", learning_rate_init=0.001,
-            max_iter=500, early_stopping=True,
-            validation_fraction=0.15, n_iter_no_change=30,
-            random_state=42,
-        )
-        self.scaler = RobustScaler()
-        self.feature_cols = FEATURE_COLS
-    
-    def train(self, train_df):
-        X = train_df[self.feature_cols].fillna(train_df[self.feature_cols].median()).fillna(0)
-        X_s = self.scaler.fit_transform(X)
-        y = train_df["graded_label"].values
-        self.model.fit(X_s, y)
-        return True
-    
-    def predict_scores(self, test_snap):
-        X = test_snap[self.feature_cols].fillna(test_snap[self.feature_cols].median()).fillna(0)
-        X_s = self.scaler.transform(X)
-        return self.model.predict(X_s)
-
-
-class EnsembleRankModel:
-    """
-    Strategy 5: ENSEMBLE — combines all strategies
-    
-    Each model produces scores → normalize to 0-1 → weighted average.
-    """
-    def __init__(self, use_pairwise=False):
-        self.graded = GradedRegressionModel()
-        self.returns = ReturnRegressionModel()
-        self.mlp = MLPRankModel()
-        self.use_pairwise = use_pairwise
-        if use_pairwise:
-            self.pairwise = PairwiseRankModel()
-        self.feature_cols = FEATURE_COLS
-    
-    def train(self, train_df):
-        self.graded.train(train_df)
-        self.returns.train(train_df)
-        self.mlp.train(train_df)
-        if self.use_pairwise:
-            self.pairwise.train(train_df)
-        return True
-    
-    def predict_scores(self, test_snap):
-        s1 = self.graded.predict_scores(test_snap)
-        s2 = self.returns.predict_scores(test_snap)
-        s3 = self.mlp.predict_scores(test_snap)
-        
-        # Normalize each to 0-1 via rank
-        def rank_norm(arr):
-            return rankdata(arr) / len(arr)
-        
-        combined = 0.4 * rank_norm(s1) + 0.35 * rank_norm(s2) + 0.25 * rank_norm(s3)
-        
-        if self.use_pairwise:
-            s4 = self.pairwise.predict_scores(test_snap)
-            combined = 0.3 * rank_norm(s1) + 0.25 * rank_norm(s2) + 0.2 * rank_norm(s3) + 0.25 * rank_norm(s4)
-        
-        return combined
-
-
-# Rule-based baselines for comparison
-class RuleBasedModel:
-    """Wraps a simple rule-based strategy as a model interface."""
-    def __init__(self, sort_col, ascending=False):
-        self.sort_col = sort_col
-        self.ascending = ascending
-        self.feature_cols = FEATURE_COLS
-    
-    def train(self, train_df):
-        return True  # No training needed
-    
-    def predict_scores(self, test_snap):
-        vals = test_snap[self.sort_col].fillna(0).values
-        if self.ascending:
-            return -vals
-        return vals
+ML_MODEL_MAP = {
+    "graded_reg": GradedRegModel, "return_reg": ReturnRegModel,
+    "mlp_nn": MLPModel, "pairwise": PairwiseModel, "ml_ensemble": MLEnsembleModel,
+}
 
 
 # ============================================================================
-# 6. WALK-FORWARD BACKTESTER
+# 8. ML BACKTESTER
 # ============================================================================
-def run_backtest(dataset, model_class, model_kwargs, top_k, target_k,
-                 min_train_periods=8, hold_days=126):
-    """Walk-forward backtest. Returns results, equity, bench, trades."""
+def run_ml_backtest(dataset, model_key, top_k, target_k, hold_days, min_train=8):
     dates = sorted(dataset["signal_date"].unique())
-    if len(dates) < min_train_periods + 2:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
-    
+    if len(dates) < min_train + 2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
+    test_step = max(1, hold_days // 21)
+    test_idxs = list(range(min_train, len(dates), test_step))
     results, trades = [], []
-    eq = [{"date": dates[min_train_periods], "value": 100.0}]
-    bm = [{"date": dates[min_train_periods], "value": 100.0}]
+    eq = [{"date": dates[min_train], "value": 100.0}]
+    bm = [{"date": dates[min_train], "value": 100.0}]
     cap, bcap = 100.0, 100.0
-    feat_imp_list = []
     last_model = None
-    
-    prog = st.progress(0, "Backtesting...")
-    total = len(dates) - min_train_periods
-    
-    # Use non-overlapping TEST dates (even though training uses overlapping)
-    test_step = max(1, hold_days // 21)  # Test every hold_days worth of sliding steps
-    test_indices = list(range(min_train_periods, len(dates), test_step))
-    total = len(test_indices)
-    
-    for prog_i, ti in enumerate(test_indices):
+    prog = st.progress(0, "ML Backtesting...")
+    total = len(test_idxs)
+
+    for pi, ti in enumerate(test_idxs):
         if ti >= len(dates): break
-        prog.progress(min(prog_i / max(total, 1), 1.0),
-                      text=f"Period {prog_i+1}/{total}...")
-        
-        test_date = dates[ti]
-        train_dates = dates[:ti]
-        
-        train_df = dataset[dataset["signal_date"].isin(train_dates)]
-        test_df = dataset[dataset["signal_date"] == test_date].copy()
-        
-        if len(train_df) < 100 or len(test_df) < top_k + 3:
-            continue
-        
-        # Train
-        model = model_class(**model_kwargs)
+        prog.progress(min(pi/max(total,1), 1.0), f"Period {pi+1}/{total}...")
+        test_dt = dates[ti]
+        train_df = dataset[dataset["signal_date"].isin(dates[:ti])]
+        test_df = dataset[dataset["signal_date"]==test_dt].copy()
+        if len(train_df) < 100 or len(test_df) < top_k+3: continue
+        model = ML_MODEL_MAP[model_key]()
         try:
             ok = model.train(train_df)
             if not ok: continue
         except: continue
-        
         last_model = model
-        
-        # Predict
-        try:
-            scores = model.predict_scores(test_df)
+        try: scores = model.predict_scores(test_df)
         except: continue
-        
         test_df["pred_score"] = scores
-        
-        # Pick top_k by score
         pred_top = test_df.nlargest(top_k, "pred_score")
         pred_set = set(pred_top["fund_id"].values)
-        
-        # Actual top target_k
         actual_top = test_df.nlargest(target_k, "forward_return")
         actual_set = set(actual_top["fund_id"].values)
-        
-        # Hit rate
         hits = len(pred_set & actual_set)
-        hr = hits / top_k
-        
-        # Returns
-        port_ret = pred_top["forward_return"].mean()
-        bench_ret = test_df["bench_return"].iloc[0]
-        perfect_ret = actual_top["forward_return"].mean()
-        
-        cap *= (1 + port_ret)
-        bcap *= (1 + bench_ret)
-        
-        entry_dt = test_df["entry_date"].iloc[0]
-        exit_dt = test_df["exit_date"].iloc[0]
-        
-        # NDCG score (ranking quality metric)
-        if len(test_df) >= top_k:
-            true_rels = test_df["graded_label"].values.reshape(1, -1)
-            pred_rels = test_df["pred_score"].values.reshape(1, -1)
-            try:
-                ndcg = ndcg_score(true_rels, pred_rels, k=top_k)
-            except: ndcg = 0
-        else: ndcg = 0
-        
-        trade = {
-            "Period": f"{pd.Timestamp(entry_dt).strftime('%Y-%m-%d')} → {pd.Timestamp(exit_dt).strftime('%Y-%m-%d')}",
-            "Pool": len(test_df), "Port %": port_ret*100, "Bench %": bench_ret*100,
-            "Alpha %": (port_ret-bench_ret)*100, "Perfect %": perfect_ret*100,
-            "Hits": hits, "HR %": hr*100, "NDCG@K": ndcg,
-        }
+        hr = hits/top_k
+        pret = pred_top["forward_return"].mean()
+        bret = test_df["bench_return"].iloc[0]
+        cap *= (1+pret); bcap *= (1+bret)
+        ent_dt = test_df["entry_date"].iloc[0]
+        ext_dt = test_df["exit_date"].iloc[0]
+        rec = {"Start": pd.Timestamp(ent_dt).strftime("%Y-%m-%d"),
+               "End": pd.Timestamp(ext_dt).strftime("%Y-%m-%d"),
+               "Pool": len(test_df), "Port %": pret*100, "Bench %": bret*100,
+               "Alpha %": (pret-bret)*100, "Hits": hits, "HR %": hr*100}
         for j, (_, row) in enumerate(pred_top.iterrows()):
-            trade[f"Pick{j+1}"] = row["fund_name"][:35]
-            trade[f"Pick{j+1}%"] = row["forward_return"]*100
-            trade[f"Pick{j+1}Hit"] = "✅" if row["fund_id"] in actual_set else "❌"
-        
-        trades.append(trade)
-        results.append({
-            "date": test_date, "entry": entry_dt, "exit": exit_dt,
-            "port_return": port_ret, "bench_return": bench_ret,
-            "hit_rate": hr, "hits": hits, "ndcg": ndcg,
-            "pool": len(test_df), "perfect_return": perfect_ret,
-        })
-        eq.append({"date": exit_dt, "value": cap})
-        bm.append({"date": exit_dt, "value": bcap})
-        
-        # Feature importance
-        if hasattr(model, 'model') and hasattr(model.model, 'feature_importances_'):
-            feat_imp_list.append(dict(zip(FEATURE_COLS, model.model.feature_importances_)))
-        elif hasattr(model, 'graded') and hasattr(model.graded.model, 'feature_importances_'):
-            feat_imp_list.append(dict(zip(FEATURE_COLS, model.graded.model.feature_importances_)))
-    
+            rec[f"Pick{j+1}"] = row["fund_name"][:35]
+            rec[f"Pick{j+1}%"] = row["forward_return"]*100
+            rec[f"Pick{j+1}Hit"] = "✅" if row["fund_id"] in actual_set else "❌"
+        trades.append(rec)
+        results.append({"date": test_dt, "return": pret, "hit_rate": hr, "bench_return": bret})
+        eq.append({"date": ext_dt, "value": cap})
+        bm.append({"date": ext_dt, "value": bcap})
     prog.empty()
-    
-    avg_imp = {}
-    if feat_imp_list:
-        for f in feat_imp_list[0]:
-            avg_imp[f] = np.mean([d.get(f, 0) for d in feat_imp_list])
-    
-    return (pd.DataFrame(results), pd.DataFrame(eq), pd.DataFrame(bm),
-            pd.DataFrame(trades), {"importances": avg_imp, "last_model": last_model})
+    return pd.DataFrame(results), pd.DataFrame(eq), pd.DataFrame(bm), pd.DataFrame(trades), last_model
 
 
 # ============================================================================
-# 7. VISUALIZATION
+# 9. CONSENSUS ENGINE — The core new feature
+# ============================================================================
+def compute_consensus_picks(nav, smap, bench, top_k, hold, ml_dataset=None, ml_models=None):
+    """
+    Run ALL strategies (rule-based + ML) and find funds that appear across
+    the most methodologies. Returns consensus_df with vote counts.
+    """
+    all_picks = {}  # {strategy_name: [fund_ids]}
+
+    # --- Rule-based picks ---
+    for strat in RULE_STRATEGIES:
+        try:
+            picks = get_rule_current_picks(nav, smap, bench, strat, top_k, hold)
+            all_picks[strat] = [p["fund_id"] for p in picks]
+        except:
+            all_picks[strat] = []
+
+    # --- ML picks (if models trained) ---
+    if ml_models:
+        latest_snap = extract_ml_features(nav, bench, len(nav)-1)
+        if len(latest_snap) > 0:
+            for mkey, model in ml_models.items():
+                try:
+                    scores = model.predict_scores(latest_snap)
+                    latest_snap_c = latest_snap.copy()
+                    latest_snap_c["pred_score"] = scores
+                    top = latest_snap_c.nlargest(top_k, "pred_score")
+                    all_picks[mkey] = top["fund_id"].tolist()
+                except:
+                    all_picks[mkey] = []
+
+    # --- Tally votes ---
+    vote_map = {}  # fund_id -> {votes, strategies, info}
+    for strat, fids in all_picks.items():
+        for fid in fids:
+            if fid not in vote_map:
+                vote_map[fid] = {"votes": 0, "strategies": [], "name": smap.get(fid, fid)}
+            vote_map[fid]["votes"] += 1
+            vote_map[fid]["strategies"].append(strat)
+
+    # Add fund metrics for display
+    dt = nav.index.max()
+    hist = nav[(nav.index >= dt - pd.Timedelta(days=400)) & (nav.index <= dt)]
+    for fid in vote_map:
+        fh = hist[fid].dropna() if fid in hist.columns else pd.Series()
+        if len(fh) >= 63:
+            rets = fh.pct_change().dropna()
+            vote_map[fid]["ret_3m"] = (fh.iloc[-1]/fh.iloc[-63]-1)*100
+            vote_map[fid]["ret_1y"] = (fh.iloc[-1]/fh.iloc[-252]-1)*100 if len(fh) >= 252 else np.nan
+            vote_map[fid]["sharpe"] = calc_sharpe(rets)
+            vote_map[fid]["vol"] = calc_vol(rets)
+
+    # Sort by votes desc, then by 3m return desc
+    sorted_funds = sorted(vote_map.items(), key=lambda x: (-x[1]["votes"], -(x[1].get("ret_3m") or 0)))
+
+    total_strats = len([s for s, picks in all_picks.items() if picks])  # Only count strategies that produced picks
+
+    return sorted_funds, all_picks, total_strats
+
+
+# ============================================================================
+# 10. VISUALIZATION HELPERS
 # ============================================================================
 def plot_equity(eq, bm, title=""):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=eq["date"], y=eq["value"], name="ML Strategy",
+    fig.add_trace(go.Scatter(x=eq["date"], y=eq["value"], name="Strategy",
         line=dict(color="#2196F3", width=2.5), fill="tozeroy", fillcolor="rgba(33,150,243,0.1)"))
     fig.add_trace(go.Scatter(x=bm["date"], y=bm["value"], name="Nifty 100",
         line=dict(color="gray", width=2, dash="dot")))
@@ -772,307 +872,334 @@ def plot_equity(eq, bm, title=""):
                       height=400, legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"))
     return fig
 
-def plot_hit_rate(res):
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=res["date"], y=res["hit_rate"]*100,
-        marker_color=["#4caf50" if h >= 0.4 else "#ff9800" if h >= 0.2 else "#f44336"
-                       for h in res["hit_rate"]]))
-    avg = res["hit_rate"].mean()*100
-    fig.add_hline(y=avg, line_dash="dash", line_color="blue",
-                  annotation_text=f"Avg: {avg:.1f}%")
-    fig.update_layout(title="Hit Rate per Period", yaxis_title="HR %", height=350)
-    return fig
-
-def plot_importance(imp, top_n=20):
-    if not imp: return None
-    s = sorted(imp.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    fig = go.Figure(go.Bar(x=[v for _,v in s], y=[n for n,_ in s], orientation="h",
-        marker_color=px.colors.sequential.Viridis[:len(s)]))
-    fig.update_layout(title="Feature Importance", height=450, yaxis=dict(autorange="reversed"))
-    return fig
 
 # ============================================================================
-# 8. STREAMLIT UI
+# 11. STREAMLIT UI — Three main tabs
 # ============================================================================
-def render_main():
+def render_run_all_tab():
+    """Tab: Run ALL strategies and compare."""
     st.markdown("""<div class="info-banner">
-        <h2>🧠 ML Fund Predictor v2 — Learning to Rank</h2>
-        <p>Pairwise Ranking + Graded Labels + 42 Features + Sliding Window Training</p>
+        <h2>🏁 Run All Strategies — Unified Comparison</h2>
+        <p>Backtest all 8 rule-based + 5 ML strategies side by side</p>
     </div>""", unsafe_allow_html=True)
 
-    # Controls
-    c1,c2,c3,c4,c5 = st.columns([2,2,1,1,1])
-    with c1: cat = st.selectbox("📁 Category", list(FILE_MAP.keys()))
-    with c2:
-        strat = st.selectbox("🤖 Strategy", [
-            ("ensemble", "🧠 Ensemble (Graded+Return+MLP)"),
-            ("graded", "📊 Graded Regression (percentile rank)"),
-            ("return_reg", "📈 Return Regression (predict return)"),
-            ("mlp", "🔮 MLP Neural Network"),
-            ("pairwise", "🔗 Pairwise Ranking"),
-        ], format_func=lambda x: x[1])[0]
-    with c3: top_k = st.number_input("🎯 Pick K", 1, 10, 5)
-    with c4: target_k = st.number_input("🏆 vs Top K", 1, 15, top_k)
-    with c5: hold = st.selectbox("📅 Hold", HOLD_PERIODS, index=1, format_func=hold_label)
-
-    adv = st.expander("⚙️ Advanced Settings")
-    with adv:
-        c1,c2,c3 = st.columns(3)
-        with c1: step = st.number_input("Slide step (days)", 7, 63, 21, help="Training window slide. Lower = more training data.")
-        with c2: min_periods = st.number_input("Min train periods", 4, 20, 8)
-        with c3: run_baselines = st.checkbox("Compare vs rule-based", True)
+    c1,c2,c3,c4,c5 = st.columns([2,1,1,1,1])
+    with c1: cat = st.selectbox("📁 Category", list(FILE_MAP.keys()), key="ra_cat")
+    with c2: top_k = st.number_input("🎯 Pick K", 1, 10, 5, key="ra_topk")
+    with c3: target_k = st.number_input("🏆 vs Top K", 1, 15, 5, key="ra_tgtk")
+    with c4: hold = st.selectbox("📅 Hold", HOLD_PERIODS, index=1, format_func=hold_label, key="ra_hold")
+    with c5: step = st.number_input("ML slide", 7, 63, 21, key="ra_step")
 
     nav, smap = load_funds(cat)
     bench = load_bench()
-    if nav is None: st.error("No data found."); return
+    if nav is None: st.error("No data."); return
+    st.success(f"✅ {len(nav.columns)} funds · {nav.index.min().strftime('%Y-%m')} → {nav.index.max().strftime('%Y-%m')}")
 
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Funds", len(nav.columns))
-    c2.metric("Period", f"{nav.index.min().strftime('%Y-%m')} → {nav.index.max().strftime('%Y-%m')}")
-    c3.metric("Features", len(FEATURE_COLS))
-    st.divider()
+    if st.button("🚀 Run All 13 Strategies", type="primary", use_container_width=True, key="ra_run"):
+        all_results = {}
 
-    if st.button("🚀 Run ML Backtest v2", type="primary", use_container_width=True):
-        # Build dataset
-        st.markdown("### 📊 Step 1: Build Dataset (sliding window)")
-        ds = build_dataset(nav, bench, smap, hold, target_k, step_days=step)
-        if ds.empty or len(ds) < 200:
-            st.error("Insufficient data."); return
-        
-        nd = ds["signal_date"].nunique()
-        st.success(f"✅ **{len(ds):,}** samples · **{nd}** dates · "
-                   f"Pos: {ds['binary_label'].sum():,} ({ds['binary_label'].mean()*100:.1f}%)")
+        # --- Rule-based ---
+        st.markdown("### 📐 Rule-Based Strategies (8)")
+        rule_prog = st.progress(0, "Running rule-based...")
+        for ri, strat in enumerate(RULE_STRATEGIES):
+            rule_prog.progress((ri+1)/len(RULE_STRATEGIES), f"{STRATEGY_INFO[strat][0]}...")
+            h, e, b, t = run_rule_backtest(nav, strat, top_k, target_k, hold, bench, smap)
+            if not e.empty:
+                yrs = (e.iloc[-1]["date"]-e.iloc[0]["date"]).days/365.25
+                cagr = (e.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+                bcagr = (b.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+                hr = h["hit_rate"].mean() if "hit_rate" in h.columns else 0
+                all_results[strat] = {
+                    "Type": "Rule", "CAGR %": cagr*100, "Bench %": bcagr*100,
+                    "Alpha %": (cagr-bcagr)*100, "HR %": hr*100,
+                    "Win %": (h["return"]>0).mean()*100, "Periods": len(h),
+                }
+        rule_prog.empty()
 
-        # Map strategy to model
-        model_map = {
-            "ensemble": (EnsembleRankModel, {}),
-            "graded": (GradedRegressionModel, {}),
-            "return_reg": (ReturnRegressionModel, {}),
-            "mlp": (MLPRankModel, {}),
-            "pairwise": (PairwiseRankModel, {}),
-        }
-        mcls, mkw = model_map[strat]
-
-        st.markdown("### 🔄 Step 2: Walk-Forward Backtest")
-        res, eq, bm, trd, info = run_backtest(
-            ds, mcls, mkw, top_k, target_k,
-            min_train_periods=min_periods, hold_days=hold)
-
-        if res.empty: st.error("No results."); return
-
-        # Store
-        st.session_state["v2_res"] = res
-        st.session_state["v2_eq"] = eq
-        st.session_state["v2_bm"] = bm
-        st.session_state["v2_trd"] = trd
-        st.session_state["v2_info"] = info
-        st.session_state["v2_ds"] = ds
-        st.session_state["v2_nav"] = nav
-        st.session_state["v2_bench"] = bench
-        st.session_state["v2_smap"] = smap
-        st.session_state["v2_strat"] = strat
-        st.session_state["v2_topk"] = top_k
-        st.session_state["v2_targetk"] = target_k
-        
-        # Run baselines
-        if run_baselines:
-            bl_results = {}
-            baselines = {
-                "Momentum 63d": ("ret_63d", False),
-                "Momentum 252d": ("ret_252d", False),
-                "Sharpe 252d": ("sharpe_252d", False),
-                "CS Rank Composite": ("cs_rank_composite", False),
-            }
-            for bl_name, (col, asc) in baselines.items():
-                bl_cls = RuleBasedModel
-                bl_kw = {"sort_col": col, "ascending": asc}
-                bl_res, _, _, _, _ = run_backtest(
-                    ds, bl_cls, bl_kw, top_k, target_k,
-                    min_train_periods=min_periods, hold_days=hold)
-                if not bl_res.empty:
-                    bl_results[bl_name] = {
-                        "Hit Rate %": bl_res["hit_rate"].mean()*100,
-                        "Avg Return %": bl_res["port_return"].mean()*100,
-                        "NDCG@K": bl_res["ndcg"].mean(),
+        # --- ML ---
+        st.markdown("### 🧠 ML Strategies (5)")
+        st.markdown("##### Building ML dataset...")
+        ds = build_ml_dataset(nav, bench, smap, hold, target_k, step_days=step)
+        if len(ds) < 200:
+            st.warning("Not enough data for ML strategies.")
+        else:
+            n_dates = ds["signal_date"].nunique()
+            st.success(f"ML Dataset: {len(ds):,} samples · {n_dates} dates")
+            ml_trained_models = {}
+            ml_prog = st.progress(0, "Running ML...")
+            for mi, mkey in enumerate(ML_STRATEGIES):
+                ml_prog.progress((mi+1)/len(ML_STRATEGIES), f"{STRATEGY_INFO[mkey][0]}...")
+                res, e, b, t, last_m = run_ml_backtest(
+                    ds, mkey, top_k, target_k, hold,
+                    min_train=max(6, n_dates//4))
+                if last_m: ml_trained_models[mkey] = last_m
+                if not res.empty:
+                    yrs = (e.iloc[-1]["date"]-e.iloc[0]["date"]).days/365.25
+                    cagr = (e.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+                    bcagr = (b.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+                    hr = res["hit_rate"].mean()
+                    all_results[mkey] = {
+                        "Type": "ML", "CAGR %": cagr*100, "Bench %": bcagr*100,
+                        "Alpha %": (cagr-bcagr)*100, "HR %": hr*100,
+                        "Win %": (res["return"]>0).mean()*100, "Periods": len(res),
                     }
-            st.session_state["v2_baselines"] = bl_results
+            ml_prog.empty()
+            st.session_state["ra_ml_models"] = ml_trained_models
+            st.session_state["ra_ml_dataset"] = ds
 
-    # Display results
-    if "v2_res" not in st.session_state:
-        st.info("👆 Click **Run ML Backtest v2** to begin.")
-        _show_methodology()
+        st.session_state["ra_results"] = all_results
+        st.session_state["ra_nav"] = nav
+        st.session_state["ra_smap"] = smap
+        st.session_state["ra_bench"] = bench
+        st.session_state["ra_topk"] = top_k
+        st.session_state["ra_hold"] = hold
+
+    # Display
+    if "ra_results" not in st.session_state:
+        st.info("👆 Click **Run All 13 Strategies** to begin.")
         return
 
-    res = st.session_state["v2_res"]
-    eq = st.session_state["v2_eq"]
-    bm = st.session_state["v2_bm"]
-    trd = st.session_state["v2_trd"]
-    info = st.session_state["v2_info"]
+    all_results = st.session_state["ra_results"]
+    if not all_results:
+        st.warning("No results generated."); return
 
-    # Metrics
-    yrs = (eq.iloc[-1]["date"] - eq.iloc[0]["date"]).days / 365.25
-    cagr = (eq.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
-    bcagr = (bm.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
-    avg_hr = res["hit_rate"].mean()
-    avg_ndcg = res["ndcg"].mean()
-    win_rate = (res["port_return"] > 0).mean()
-    vals = eq["value"].values
-    mdd = ((vals - np.maximum.accumulate(vals)) / np.maximum.accumulate(vals)).min()
+    # Build comparison table
+    comp_df = pd.DataFrame(all_results).T
+    comp_df.index = [f"{STRATEGY_INFO.get(k, ('',''))[0]}" for k in all_results.keys()]
+    comp_df.index.name = "Strategy"
+    comp_df = comp_df.sort_values("Alpha %", ascending=False)
 
-    st.markdown("### 📈 Results")
-    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-    c1.metric("ML CAGR", f"{cagr*100:.2f}%")
-    c2.metric("Bench CAGR", f"{bcagr*100:.2f}%")
-    c3.metric("Alpha", f"{(cagr-bcagr)*100:+.2f}%")
-    c4.metric("Avg Hit Rate", f"{avg_hr*100:.1f}%")
-    c5.metric("NDCG@K", f"{avg_ndcg:.3f}")
-    c6.metric("Win Rate", f"{win_rate*100:.1f}%")
-    c7.metric("Max DD", f"{mdd*100:.1f}%")
+    st.markdown("### 📊 Strategy Comparison Matrix")
+    st.dataframe(
+        comp_df.style.format({
+            "CAGR %": "{:.2f}", "Bench %": "{:.2f}", "Alpha %": "{:+.2f}",
+            "HR %": "{:.1f}", "Win %": "{:.1f}", "Periods": "{:.0f}",
+        }).background_gradient(subset=["Alpha %","HR %"], cmap="RdYlGn"),
+        use_container_width=True, height=600,
+    )
 
-    tabs = st.tabs(["📈 Equity", "🎯 Hit Rate", "📋 Trades", "🏅 Features",
-                     "📊 vs Baselines", "🔮 Today's Picks"])
+    # Bar chart
+    fig = go.Figure()
+    strats = comp_df.index.tolist()
+    colors = ["#2196F3" if "ML" not in str(comp_df.loc[s,"Type"]) else "#9c27b0" for s in strats]
+    fig.add_trace(go.Bar(name="Alpha %", x=strats, y=comp_df["Alpha %"], marker_color=colors))
+    fig.add_trace(go.Bar(name="HR %", x=strats, y=comp_df["HR %"], marker_color=
+        ["#4caf50" if "ML" not in str(comp_df.loc[s,"Type"]) else "#e91e63" for s in strats]))
+    fig.update_layout(barmode="group", title="Alpha & Hit Rate by Strategy", height=450,
+                      xaxis_tickangle=-30)
+    st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[0]:
-        sname = st.session_state.get("v2_strat","").upper()
-        st.plotly_chart(plot_equity(eq, bm, f"{sname} vs Benchmark"), use_container_width=True)
+    st.download_button("📥 Download Comparison", comp_df.to_csv(), "all_strategies_comparison.csv")
 
-    with tabs[1]:
-        st.plotly_chart(plot_hit_rate(res), use_container_width=True)
-        # Distribution
-        bins = [0, 0.2, 0.4, 0.6, 0.8, 1.01]
-        labels = ["0-20%","20-40%","40-60%","60-80%","80-100%"]
-        counts = pd.cut(res["hit_rate"], bins=bins, labels=labels).value_counts().sort_index()
-        fig = go.Figure(go.Bar(x=labels, y=counts.values,
-            marker_color=["#f44336","#ff9800","#ffc107","#8bc34a","#4caf50"]))
-        fig.update_layout(title="HR Distribution", height=300)
-        st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[2]:
-        if not trd.empty:
-            pct = [c for c in trd.columns if "%" in c]
-            fmt = {c: "{:.2f}" for c in pct}
-            fmt["Hits"] = "{:.0f}"; fmt["Pool"] = "{:.0f}"; fmt["NDCG@K"] = "{:.3f}"
-            hit_cols = [c for c in trd.columns if "Hit" in c and "%" not in c]
-            sty = trd.style.format(fmt, na_rep="")
-            for c in hit_cols:
-                sty = sty.map(lambda v: "background-color:#c8e6c9" if v=="✅"
-                              else "background-color:#ffcdd2" if v=="❌" else "", subset=[c])
-            st.dataframe(sty, use_container_width=True, height=600)
-            st.download_button("📥 Download", trd.to_csv(index=False), "ml_v2_trades.csv")
+def render_consensus_tab():
+    """Tab: Consensus picks across ALL methodologies."""
+    st.markdown("""<div class="info-banner">
+        <h2>🤝 Consensus Picks — Funds Common Across ALL Methods</h2>
+        <p>Highest conviction: funds picked by the most strategies (rule-based + ML)</p>
+    </div>""", unsafe_allow_html=True)
 
-    with tabs[3]:
-        imp = info.get("importances", {})
-        if imp:
-            fig = plot_importance(imp)
-            if fig: st.plotly_chart(fig, use_container_width=True)
+    nav = st.session_state.get("ra_nav")
+    smap = st.session_state.get("ra_smap")
+    bench = st.session_state.get("ra_bench")
+    ml_models = st.session_state.get("ra_ml_models", {})
+    top_k = st.session_state.get("ra_topk", 5)
+    hold = st.session_state.get("ra_hold", 126)
 
-    with tabs[4]:
-        bl = st.session_state.get("v2_baselines", {})
-        if bl:
-            comp = {"🧠 ML " + st.session_state.get("v2_strat","").upper(): {
-                "Hit Rate %": avg_hr*100,
-                "Avg Return %": res["port_return"].mean()*100,
-                "NDCG@K": avg_ndcg,
-            }}
-            comp.update(bl)
-            cdf = pd.DataFrame(comp).T
-            cdf.index.name = "Strategy"
-            st.dataframe(cdf.style.format({
-                "Hit Rate %": "{:.1f}", "Avg Return %": "{:.2f}", "NDCG@K": "{:.3f}"
-            }).background_gradient(subset=["Hit Rate %"], cmap="RdYlGn"), use_container_width=True)
-            
-            # Chart
-            fig = go.Figure()
-            fig.add_trace(go.Bar(name="Hit Rate %", x=list(comp.keys()),
-                y=[comp[s]["Hit Rate %"] for s in comp], marker_color="#2196F3"))
-            fig.add_trace(go.Bar(name="NDCG@K", x=list(comp.keys()),
-                y=[comp[s]["NDCG@K"]*100 for s in comp], marker_color="#4caf50"))
-            fig.update_layout(barmode="group", title="ML vs Rule-Based", height=400)
-            st.plotly_chart(fig, use_container_width=True)
+    if nav is None:
+        st.info("👆 First run **Run All 13 Strategies** in the previous tab to train models.")
+        return
+
+    st.markdown(f"**Category:** {len(nav.columns)} funds · **Top K:** {top_k} · **Hold:** {hold_label(hold)}")
+    st.markdown(f"**ML Models trained:** {len(ml_models)} · **Rule strategies:** {len(RULE_STRATEGIES)}")
+    st.divider()
+
+    with st.spinner("Computing consensus across all strategies..."):
+        sorted_funds, all_picks, total_strats = compute_consensus_picks(
+            nav, smap, bench, top_k, hold, ml_models=ml_models)
+
+    if not sorted_funds:
+        st.warning("No consensus found."); return
+
+    # Show total strategies that produced picks
+    st.markdown(f"### Strategies that produced picks: **{total_strats}** / {len(RULE_STRATEGIES)+len(ml_models)}")
+
+    # Determine max votes
+    max_votes = sorted_funds[0][1]["votes"] if sorted_funds else 0
+
+    # Top consensus picks
+    st.markdown("### 🏆 Consensus Ranking — Top Funds")
+    st.markdown(f"*Funds sorted by number of strategies that picked them (out of {total_strats})*")
+
+    for idx, (fid, info) in enumerate(sorted_funds[:top_k * 3]):  # Show more than top_k
+        votes = info["votes"]
+        pct = votes / total_strats * 100 if total_strats > 0 else 0
+        strats = info["strategies"]
+
+        # Color coding
+        if pct >= 60: badge_class = "vote-high"
+        elif pct >= 30: badge_class = "vote-med"
+        else: badge_class = "vote-low"
+
+        # Strategy badges
+        badges_html = ""
+        for s in strats:
+            sinfo = STRATEGY_INFO.get(s, ("?",""))
+            sname = sinfo[0][:15]
+            bc = "vote-high" if s in ML_STRATEGIES else "vote-med"
+            badges_html += f'<span class="vote-badge {bc}">{sname}</span>'
+
+        r3m = info.get("ret_3m", np.nan)
+        r1y = info.get("ret_1y", np.nan)
+        sharpe = info.get("sharpe", np.nan)
+        r3m_str = f"{r3m:.1f}%" if not pd.isna(r3m) else "N/A"
+        r1y_str = f"{r1y:.1f}%" if not pd.isna(r1y) else "N/A"
+        sh_str = f"{sharpe:.2f}" if not pd.isna(sharpe) else "N/A"
+
+        if idx < top_k:
+            # Top picks get special styling
+            st.markdown(f"""<div class="consensus-card">
+                <div class="rank">#{idx+1}</div>
+                <div class="name">{info['name'][:55]}</div>
+                <div class="votes">🗳️ {votes}/{total_strats} strategies ({pct:.0f}%)</div>
+                <div style="font-size:.8rem;color:#555;margin-top:6px">
+                    3M: {r3m_str} · 1Y: {r1y_str} · Sharpe: {sh_str}
+                </div>
+                <div style="margin-top:6px">{badges_html}</div>
+            </div>""", unsafe_allow_html=True)
         else:
-            st.info("Enable 'Compare vs rule-based' and rerun.")
+            # Others get simpler styling
+            st.markdown(f"""<div class="pick-card">
+                <div class="rank" style="color:#666">#{idx+1}</div>
+                <div class="name">{info['name'][:55]}</div>
+                <div class="score">🗳️ {votes}/{total_strats} ({pct:.0f}%)</div>
+                <div style="font-size:.75rem;margin-top:4px">{badges_html}</div>
+            </div>""", unsafe_allow_html=True)
 
-    with tabs[5]:
-        nav = st.session_state.get("v2_nav")
-        bench = st.session_state.get("v2_bench")
-        smap = st.session_state.get("v2_smap")
-        lm = info.get("last_model")
-        
-        if nav is not None and lm is not None:
-            with st.spinner("Generating today's predictions..."):
-                latest_snap = extract_features(nav, bench, len(nav)-1)
-                if len(latest_snap) > 0:
-                    try:
-                        scores = lm.predict_scores(latest_snap)
-                        latest_snap["pred_score"] = scores
-                        picks = latest_snap.nlargest(st.session_state.get("v2_topk", 5), "pred_score")
-                        
-                        st.markdown(f"**Date:** {nav.index[-1].strftime('%Y-%m-%d')} | **Funds scored:** {len(latest_snap)}")
-                        st.divider()
-                        
-                        cols = st.columns(min(len(picks), 5))
-                        for idx, (_, row) in enumerate(picks.iterrows()):
-                            with cols[idx % len(cols)]:
-                                nm = smap.get(row["fund_id"], row["fund_id"])
-                                r63 = row.get("ret_63d", 0) or 0
-                                r252 = row.get("ret_252d", 0) or 0
-                                sh = row.get("sharpe_252d", 0) or 0
-                                st.markdown(f"""<div class="pick-card">
-                                    <div class="rank">#{idx+1}</div>
-                                    <div class="name">{nm[:50]}</div>
-                                    <div class="score">Score: {row['pred_score']:.4f}</div>
-                                    <div style="font-size:.8rem;color:#666;margin-top:4px">
-                                        3M: {r63*100:.1f}% · 1Y: {r252*100:.1f}% · Sharpe: {sh:.2f}
-                                    </div>
-                                </div>""", unsafe_allow_html=True)
-                    except Exception as e:
-                        st.error(f"Prediction error: {e}")
+    st.divider()
+
+    # Strategy × Fund matrix
+    st.markdown("### 📊 Strategy × Fund Matrix")
+    # Build matrix
+    top_fund_ids = [fid for fid, _ in sorted_funds[:top_k * 2]]
+    matrix_data = []
+    for fid in top_fund_ids:
+        row = {"Fund": smap.get(fid, fid)[:40]}
+        for strat, picks in all_picks.items():
+            sname = STRATEGY_INFO.get(strat, (strat,""))[0][:12]
+            row[sname] = "✅" if fid in picks else ""
+        info = dict(sorted_funds).get(fid, {}) if isinstance(sorted_funds, list) else {}
+        # Find info
+        for f, i in sorted_funds:
+            if f == fid: info = i; break
+        row["Votes"] = info.get("votes", 0)
+        matrix_data.append(row)
+
+    matrix_df = pd.DataFrame(matrix_data).sort_values("Votes", ascending=False)
+
+    def color_check(v):
+        if v == "✅": return "background-color: #c8e6c9; text-align: center"
+        return "text-align: center"
+
+    strat_cols = [c for c in matrix_df.columns if c not in ("Fund", "Votes")]
+    sty = matrix_df.style.format({"Votes": "{:.0f}"})
+    for c in strat_cols:
+        sty = sty.map(color_check, subset=[c])
+    sty = sty.background_gradient(subset=["Votes"], cmap="Greens")
+    st.dataframe(sty, use_container_width=True, height=600)
+
+    st.download_button("📥 Download Consensus", matrix_df.to_csv(index=False), "consensus_picks.csv")
+
+
+def render_individual_tab():
+    """Tab: Run individual strategies with detailed backtest."""
+    st.markdown("""<div class="info-banner">
+        <h2>🔬 Individual Strategy Backtest</h2>
+        <p>Deep dive into any single rule-based or ML strategy</p>
+    </div>""", unsafe_allow_html=True)
+
+    c1,c2,c3,c4,c5 = st.columns([2,2,1,1,1])
+    with c1: cat = st.selectbox("📁 Category", list(FILE_MAP.keys()), key="ind_cat")
+    with c2:
+        all_opts = [(k, STRATEGY_INFO[k][0]) for k in ALL_STRATEGIES]
+        strat_key = st.selectbox("🤖 Strategy", all_opts, format_func=lambda x: x[1], key="ind_strat")[0]
+    with c3: top_k = st.number_input("🎯 Pick K", 1, 10, 5, key="ind_topk")
+    with c4: target_k = st.number_input("🏆 vs Top K", 1, 15, 5, key="ind_tgtk")
+    with c5: hold = st.selectbox("📅 Hold", HOLD_PERIODS, index=1, format_func=hold_label, key="ind_hold")
+
+    nav, smap = load_funds(cat)
+    bench = load_bench()
+    if nav is None: st.error("No data."); return
+
+    is_ml = strat_key in ML_STRATEGIES
+
+    if st.button(f"🚀 Run {STRATEGY_INFO[strat_key][0]}", type="primary", use_container_width=True, key="ind_run"):
+        if is_ml:
+            st.markdown("#### Building ML dataset...")
+            ds = build_ml_dataset(nav, bench, smap, hold, target_k, step_days=21)
+            if len(ds) < 200: st.error("Insufficient data."); return
+            nd = ds["signal_date"].nunique()
+            st.success(f"Dataset: {len(ds):,} samples · {nd} dates")
+            res, eq, bm, trd, last_m = run_ml_backtest(ds, strat_key, top_k, target_k, hold, max(6, nd//4))
         else:
-            st.info("Run backtest first to train model.")
+            res, eq, bm, trd = run_rule_backtest(nav, strat_key, top_k, target_k, hold, bench, smap)
+
+        if eq.empty: st.error("No results."); return
+
+        yrs = (eq.iloc[-1]["date"]-eq.iloc[0]["date"]).days/365.25
+        cagr = (eq.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+        bcagr = (bm.iloc[-1]["value"]/100)**(1/yrs)-1 if yrs > 0 else 0
+        hr = res["hit_rate"].mean() if "hit_rate" in res.columns else 0
+        wr = (res["return"]>0).mean() if "return" in res.columns else 0
+        vals = eq["value"].values
+        mdd = ((vals-np.maximum.accumulate(vals))/np.maximum.accumulate(vals)).min()
+
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        c1.metric("CAGR", f"{cagr*100:.2f}%")
+        c2.metric("Bench", f"{bcagr*100:.2f}%")
+        c3.metric("Alpha", f"{(cagr-bcagr)*100:+.2f}%")
+        c4.metric("Hit Rate", f"{hr*100:.1f}%")
+        c5.metric("Win Rate", f"{wr*100:.1f}%")
+        c6.metric("Max DD", f"{mdd*100:.1f}%")
+
+        t1, t2 = st.tabs(["📈 Equity Curve", "📋 Trade Details"])
+        with t1:
+            st.plotly_chart(plot_equity(eq, bm, STRATEGY_INFO[strat_key][0]), use_container_width=True)
+        with t2:
+            if not trd.empty:
+                pct = [c for c in trd.columns if "%" in c]
+                fmt = {c: "{:.2f}" for c in pct}
+                fmt["Hits"] = "{:.0f}"; fmt["Pool"] = "{:.0f}"
+                hit_cols = [c for c in trd.columns if "Hit" in c and "%" not in c]
+                sty = trd.style.format(fmt, na_rep="")
+                for c in hit_cols:
+                    sty = sty.map(lambda v: "background-color:#c8e6c9" if v=="✅"
+                                  else "background-color:#ffcdd2" if v=="❌" else "", subset=[c])
+                st.dataframe(sty, use_container_width=True, height=600)
+                st.download_button("📥 Download", trd.to_csv(index=False),
+                                   f"{strat_key}_trades.csv", key="ind_dl")
 
 
-def _show_methodology():
-    with st.expander("📖 Why v2 is Different — 5 Key Fixes", expanded=True):
-        st.markdown("""
-<div class="problem-box"><b>❌ Problem 1:</b> Binary labels (top-5 = 1, rest = 0) destroy information. 
-Fund #6 gets same label as fund #50.</div>
-<div class="fix-box"><b>✅ Fix:</b> <b>Graded labels</b> — use percentile rank (0.0 to 1.0). 
-Fund #1 gets 1.0, #6 gets 0.88, #50 gets 0.02.</div>
-
-<div class="problem-box"><b>❌ Problem 2:</b> Classification loss (cross-entropy) optimizes probability accuracy, 
-not ranking quality. Small probability errors cause big ranking errors.</div>
-<div class="fix-box"><b>✅ Fix:</b> <b>Pairwise ranking</b> — directly asks "is fund A better than fund B?" 
-Plus regression on percentile rank which preserves ordinal structure.</div>
-
-<div class="problem-box"><b>❌ Problem 3:</b> Non-overlapping windows → only ~15 training periods → ~750 samples.
-Way too little for ML to learn patterns.</div>
-<div class="fix-box"><b>✅ Fix:</b> <b>Sliding window</b> with step=21 days → 5-10x more training data (3000-8000 samples).
-Test dates are still non-overlapping to avoid double-counting.</div>
-
-<div class="problem-box"><b>❌ Problem 4:</b> Missing key features: no short-term momentum (5d), 
-no stability metrics, no momentum ratios.</div>
-<div class="fix-box"><b>✅ Fix:</b> <b>42 features</b> including 5d momentum, vol-of-vol, up/down ratio, 
-quarterly consistency, momentum acceleration, and short/long momentum ratio.</div>
-
-<div class="problem-box"><b>❌ Problem 5:</b> Single model can't capture all market regimes.</div>
-<div class="fix-box"><b>✅ Fix:</b> <b>5 model strategies</b> including Pairwise Ranking, Graded Regression, 
-Return Prediction, MLP, and Rank-Normalized Ensemble.</div>
-
-### Evaluation Metric: NDCG@K
-We also report **NDCG@K** (Normalized Discounted Cumulative Gain), the standard 
-ranking quality metric. This measures not just *if* we got the right funds, 
-but *how close* our ranking is to the ideal ranking. NDCG=1.0 means perfect ranking.
-        """, unsafe_allow_html=True)
-
-
+# ============================================================================
+# 12. MAIN
+# ============================================================================
 def main():
     st.markdown("""<div style="text-align:center;padding:10px 0 15px">
-        <h1 style="margin:0;border:none">🧠 ML Fund Predictor v2</h1>
-        <p style="color:#666">Learning-to-Rank · Pairwise · Graded Labels · 42 Features · Sliding Window</p>
+        <h1 style="margin:0;border:none">🧠 Unified Fund Predictor</h1>
+        <p style="color:#666">8 Rule-Based + 5 ML Strategies · Run All · Consensus Picks</p>
     </div>""", unsafe_allow_html=True)
-    render_main()
-    st.caption("ML Fund Predictor v2 | Fixes: Graded labels, Pairwise ranking, "
-               "Sliding window, 42 features, Ensemble | NDCG@K evaluation")
+
+    tab1, tab2, tab3 = st.tabs([
+        "🏁 Run All & Compare",
+        "🤝 Consensus Picks",
+        "🔬 Individual Backtest",
+    ])
+
+    with tab1: render_run_all_tab()
+    with tab2: render_consensus_tab()
+    with tab3: render_individual_tab()
+
+    st.caption("Unified Fund Predictor | 8 Rule-Based + 5 ML | Consensus Engine | Walk-Forward Backtest")
 
 
 if __name__ == "__main__":
