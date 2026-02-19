@@ -951,8 +951,6 @@ def render_run_all_tab():
         st.session_state["ra_nav"] = nav
         st.session_state["ra_smap"] = smap
         st.session_state["ra_bench"] = bench
-        st.session_state["ra_topk"] = top_k
-        st.session_state["ra_hold"] = hold
 
     # Display
     if "ra_results" not in st.session_state:
