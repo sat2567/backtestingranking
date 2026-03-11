@@ -395,7 +395,18 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark):
         s = nav_df[col].dropna()
         if len(s) < 260: continue
         rets = s.pct_change().dropna()
-        row = {'Fund Name': scheme_map.get(col, col), 'fund_id': col, 'Days': len(s)}
+        active_since = s.index.min()
+        active_days = (s.index.max() - active_since).days
+        active_years = active_days / 365.25
+        if active_years >= 1:
+            yrs = int(active_years)
+            mnths = int(round((active_years - yrs) * 12))
+            history_str = f"{yrs}Y {mnths}M" if mnths > 0 else f"{yrs}Y"
+        else:
+            mnths = int(round(active_years * 12))
+            history_str = f"{mnths}M"
+        row = {'Fund Name': scheme_map.get(col, col), 'fund_id': col, 'Days': len(s),
+               'Active Since': active_since.strftime('%b %Y'), 'History': history_str}
         if len(s) >= 63: row['Return 3M %'] = (s.iloc[-1] / s.iloc[-63] - 1) * 100
         if len(s) >= 126: row['Return 6M %'] = (s.iloc[-1] / s.iloc[-126] - 1) * 100
         if len(s) >= 252: row['Return 1Y %'] = (s.iloc[-1] / s.iloc[-252] - 1) * 100
@@ -711,8 +722,9 @@ def render_explorer_tab():
         if mdf.empty: st.warning("No data."); return
         tabs = st.tabs(["🏆 Rankings", "📈 Returns", "⚠️ Risk", "⚖️ Risk-Adjusted", "🎯 Benchmark", "🔄 Rolling"])
         with tabs[0]:
-            cols = [c for c in ['Fund Name', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
-            st.dataframe(mdf[cols].head(25).style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'Active Since', 'History', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
+            fmt = {c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Active Since', 'History')}
+            st.dataframe(mdf[cols].head(25).style.format(fmt).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
         with tabs[1]:
             cols = [c for c in ['Fund Name', 'Return 3M %', 'Return 6M %', 'Return 1Y %', 'Return 3Y % (Ann)', 'CAGR %'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Return 1Y %'] if 'Return 1Y %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
