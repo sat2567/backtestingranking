@@ -324,17 +324,16 @@ def is_regular_growth_fund(name):
     """Filter out non-regular-growth funds: IDCW, Dividend, Direct, Bonus, Institutional etc."""
     n = str(name).lower()
     exclude_keywords = [
-        'idcw', 'dividend', 'div ', 'div.', 'div)', 
+        'idcw', 'dividend', 'div ', 'div.', 'div)',
         'direct', 'dir ', 'dir)',
         'bonus',
         'institutional',
         'segregated',
         'payout',
-        'reinvestment',  # IDCW reinvestment
-        'monthly', 'quarterly', 'annual',  # periodic dividend plans
-        'option', 'opt',  # dividend option
+        'reinvestment',
+        'monthly', 'quarterly', 'annual',
+        'option', 'opt',
     ]
-    # Exclude if any keyword matches
     for kw in exclude_keywords:
         if kw in n:
             return False
@@ -396,7 +395,18 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark):
         s = nav_df[col].dropna()
         if len(s) < 260: continue
         rets = s.pct_change().dropna()
-        row = {'Fund Name': scheme_map.get(col, col), 'fund_id': col, 'Days': len(s)}
+        active_since = s.index.min()
+        active_days = (s.index.max() - active_since).days
+        active_years = active_days / 365.25
+        if active_years >= 1:
+            yrs = int(active_years)
+            mnths = int(round((active_years - yrs) * 12))
+            history_str = f"{yrs}Y {mnths}M" if mnths > 0 else f"{yrs}Y"
+        else:
+            mnths = int(round(active_years * 12))
+            history_str = f"{mnths}M"
+        row = {'Fund Name': scheme_map.get(col, col), 'fund_id': col, 'Days': len(s),
+               'Active Since': active_since.strftime('%b %Y'), 'History': history_str}
         if len(s) >= 63: row['Return 3M %'] = (s.iloc[-1] / s.iloc[-63] - 1) * 100
         if len(s) >= 126: row['Return 6M %'] = (s.iloc[-1] / s.iloc[-126] - 1) * 100
         if len(s) >= 252: row['Return 1Y %'] = (s.iloc[-1] / s.iloc[-252] - 1) * 100
@@ -414,12 +424,18 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark):
         row['Up Cap %'] = up * 100 if up else np.nan
         row['Down Cap %'] = down * 100 if down else np.nan
         row['Cap Ratio'] = ratio
-        roll = calculate_rolling_metrics(s, benchmark, 252)
-        row['1Y Roll %'] = roll[0] * 100 if roll[0] else np.nan
-        row['1Y Beat %'] = roll[1] * 100 if roll[1] else np.nan
-        row['1Y Consistency'] = roll[2] if roll[2] else np.nan
-        row['Trend OK'] = check_trend_confirmation(s)
-        row['DD OK'] = check_drawdown_recency(s)
+        roll1 = calculate_rolling_metrics(s, benchmark, 252)
+        row['1Y Roll Ret %'] = roll1[0] * 100 if roll1[0] else np.nan
+        row['1Y Beat %'] = roll1[1] * 100 if roll1[1] else np.nan
+        row['1Y Consistency'] = roll1[2] if roll1[2] else np.nan
+        roll3 = calculate_rolling_metrics(s, benchmark, 756)
+        row['3Y Roll Ret %'] = roll3[0] * 100 if roll3[0] else np.nan
+        row['3Y Beat %'] = roll3[1] * 100 if roll3[1] else np.nan
+        row['3Y Consistency'] = roll3[2] if roll3[2] else np.nan
+        roll5 = calculate_rolling_metrics(s, benchmark, 1260)
+        row['5Y Roll Ret %'] = roll5[0] * 100 if roll5[0] else np.nan
+        row['5Y Beat %'] = roll5[1] * 100 if roll5[1] else np.nan
+        row['5Y Consistency'] = roll5[2] if roll5[2] else np.nan
         row['Vol Adj Mom'] = calculate_vol_adjusted_momentum(s)
         metrics.append(row)
     df = pd.DataFrame(metrics)
@@ -573,11 +589,9 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, opt
             results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': alpha, 'hit_rate': hr, 'cfg': cfg})
     if not results:
         return None, []
-    # Sort based on user's optimization choice
     if optimize_by == 'hit_rate':
         results.sort(key=lambda x: x['hit_rate'], reverse=True)
     elif optimize_by == 'balanced':
-        # Normalize alpha and hit_rate to 0-1 range, then average
         max_alpha = max(r['alpha'] for r in results) or 1
         min_alpha = min(r['alpha'] for r in results)
         alpha_range = max_alpha - min_alpha if max_alpha != min_alpha else 1
@@ -587,10 +601,9 @@ def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, opt
         for r in results:
             r['balanced_score'] = 0.5 * ((r['alpha'] - min_alpha) / alpha_range) + 0.5 * ((r['hit_rate'] - min_hr) / hr_range)
         results.sort(key=lambda x: x['balanced_score'], reverse=True)
-    else:  # alpha
+    else:
         results.sort(key=lambda x: x['alpha'], reverse=True)
     best = results[0]
-    # Get current picks for the BEST strategy
     if best['key'] == 'smart_ensemble':
         picks_raw, _ = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
         best_picks = [{'fund_id': p['fund_id'], 'name': p['name']} for p in picks_raw]
@@ -612,7 +625,6 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
     best = result['best']
     all_results = result['all_results']
 
-    # Optimization label
     opt_labels = {'alpha': 'Highest Alpha', 'hit_rate': 'Highest Hit Rate', 'balanced': 'Balanced (Alpha + Hit Rate)'}
     opt_label = opt_labels.get(optimize_by, 'Highest Alpha')
 
@@ -631,7 +643,6 @@ def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimiz
         </div>
     </div>""", unsafe_allow_html=True)
 
-    # Strategy explanation
     st.markdown(f"""<div class="strategy-box">
         <h4>How {best['name']} Works</h4>
         <p><strong>Summary:</strong> {best_def['short_desc']}</p>
@@ -697,6 +708,32 @@ def render_explorer_tab():
     nav_df, scheme_map = load_fund_data_raw(category)
     benchmark = load_nifty_data()
     if nav_df is None: st.error("Could not load data."); return
+
+    # ── Date Range Filter ──────────────────────────────────────────────────
+    data_min = nav_df.index.min().date()
+    data_max = nav_df.index.max().date()
+    st.markdown("##### 📅 Custom Date Range")
+    dr1, dr2, dr3 = st.columns([2, 2, 1])
+    with dr1:
+        start_date = st.date_input("From", value=data_min, min_value=data_min, max_value=data_max, key="exp_start")
+    with dr2:
+        end_date = st.date_input("To", value=data_max, min_value=data_min, max_value=data_max, key="exp_end")
+    with dr3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("↺ Reset", key="exp_reset"):
+            start_date = data_min
+            end_date = data_max
+    if start_date >= end_date:
+        st.error("Start date must be before end date."); return
+    start_ts = pd.Timestamp(start_date)
+    end_ts   = pd.Timestamp(end_date)
+    nav_df   = nav_df[(nav_df.index >= start_ts) & (nav_df.index <= end_ts)]
+    if benchmark is not None:
+        benchmark = benchmark[(benchmark.index >= start_ts) & (benchmark.index <= end_ts)]
+    # Drop funds with fewer than 60 trading days in the selected window
+    nav_df = nav_df.loc[:, nav_df.notna().sum() >= 60]
+    # ──────────────────────────────────────────────────────────────────────
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Funds", len(nav_df.columns))
     c2.metric("Period", f"{nav_df.index.min().strftime('%Y-%m')} to {nav_df.index.max().strftime('%Y-%m')}")
@@ -711,14 +748,15 @@ def render_explorer_tab():
         if mdf.empty: st.warning("No data."); return
         tabs = st.tabs(["🏆 Rankings", "📈 Returns", "⚠️ Risk", "⚖️ Risk-Adjusted", "🎯 Benchmark", "🔄 Rolling"])
         with tabs[0]:
-            cols = [c for c in ['Fund Name', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe', 'Trend OK', 'DD OK'] if c in mdf.columns]
-            st.dataframe(mdf[cols].head(25).style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Trend OK', 'DD OK')}).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'Active Since', 'History', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
+            fmt = {c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Active Since', 'History')}
+            st.dataframe(mdf[cols].head(25).style.format(fmt).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
         with tabs[1]:
             cols = [c for c in ['Fund Name', 'Return 3M %', 'Return 6M %', 'Return 1Y %', 'Return 3Y % (Ann)', 'CAGR %'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Return 1Y %'] if 'Return 1Y %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[2]:
-            cols = [c for c in ['Fund Name', 'Volatility %', 'Max DD %', 'Trend OK', 'DD OK'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Trend OK', 'DD OK')}).background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'Volatility %', 'Max DD %'] if c in mdf.columns]
+            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[3]:
             cols = [c for c in ['Fund Name', 'Sharpe', 'Sortino', 'Calmar'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Sharpe'] if 'Sharpe' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
@@ -726,8 +764,10 @@ def render_explorer_tab():
             cols = [c for c in ['Fund Name', 'Beta', 'Alpha %', 'Up Cap %', 'Down Cap %', 'Cap Ratio'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Alpha %'] if 'Alpha %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[5]:
-            cols = [c for c in ['Fund Name', '1Y Roll %', '1Y Beat %', '1Y Consistency', 'Vol Adj Mom'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}), use_container_width=True, height=600)
+            roll_cols = [c for c in ['Fund Name', '1Y Roll Ret %', '3Y Roll Ret %', '5Y Roll Ret %'] if c in mdf.columns]
+            fmt = {c: '{:.2f}' for c in roll_cols if c != 'Fund Name'}
+            grad_col = next((c for c in ['1Y Roll Ret %', '3Y Roll Ret %', '5Y Roll Ret %'] if c in roll_cols), None)
+            st.dataframe(mdf[roll_cols].style.format(fmt).background_gradient(subset=[grad_col] if grad_col else [], cmap='RdYlGn'), use_container_width=True, height=600)
         st.download_button("📥 Download", mdf.to_csv(index=False), f"{category}_metrics.csv", key="dl_metrics")
     elif "Quarterly" in view:
         rdf = calculate_quarterly_ranks(nav_df, scheme_map)
