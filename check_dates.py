@@ -413,12 +413,18 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark):
         row['Up Cap %'] = up * 100 if up else np.nan
         row['Down Cap %'] = down * 100 if down else np.nan
         row['Cap Ratio'] = ratio
-        roll = calculate_rolling_metrics(s, benchmark, 252)
-        row['1Y Roll %'] = roll[0] * 100 if roll[0] else np.nan
-        row['1Y Beat %'] = roll[1] * 100 if roll[1] else np.nan
-        row['1Y Consistency'] = roll[2] if roll[2] else np.nan
-        row['Trend OK'] = check_trend_confirmation(s)
-        row['DD OK'] = check_drawdown_recency(s)
+        roll1 = calculate_rolling_metrics(s, benchmark, 252)
+        row['1Y Roll Ret %'] = roll1[0] * 100 if roll1[0] else np.nan
+        row['1Y Beat %'] = roll1[1] * 100 if roll1[1] else np.nan
+        row['1Y Consistency'] = roll1[2] if roll1[2] else np.nan
+        roll3 = calculate_rolling_metrics(s, benchmark, 756)
+        row['3Y Roll Ret %'] = roll3[0] * 100 if roll3[0] else np.nan
+        row['3Y Beat %'] = roll3[1] * 100 if roll3[1] else np.nan
+        row['3Y Consistency'] = roll3[2] if roll3[2] else np.nan
+        roll5 = calculate_rolling_metrics(s, benchmark, 1260)
+        row['5Y Roll Ret %'] = roll5[0] * 100 if roll5[0] else np.nan
+        row['5Y Beat %'] = roll5[1] * 100 if roll5[1] else np.nan
+        row['5Y Consistency'] = roll5[2] if roll5[2] else np.nan
         row['Vol Adj Mom'] = calculate_vol_adjusted_momentum(s)
         metrics.append(row)
     df = pd.DataFrame(metrics)
@@ -720,8 +726,20 @@ def render_explorer_tab():
             cols = [c for c in ['Fund Name', 'Beta', 'Alpha %', 'Up Cap %', 'Down Cap %', 'Cap Ratio'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Alpha %'] if 'Alpha %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[5]:
-            cols = [c for c in ['Fund Name', '1Y Roll %', '1Y Beat %', '1Y Consistency', 'Vol Adj Mom'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}), use_container_width=True, height=600)
+            st.markdown("#### 1-Year Rolling Returns")
+            cols_1y = [c for c in ['Fund Name', '1Y Roll Ret %', '1Y Beat %', '1Y Consistency'] if c in mdf.columns]
+            if cols_1y:
+                st.dataframe(mdf[cols_1y].style.format({c: '{:.2f}' for c in cols_1y if c != 'Fund Name'}).background_gradient(subset=['1Y Roll Ret %'] if '1Y Roll Ret %' in cols_1y else [], cmap='RdYlGn'), use_container_width=True, height=400)
+            st.markdown("#### 3-Year Rolling Returns")
+            cols_3y = [c for c in ['Fund Name', '3Y Roll Ret %', '3Y Beat %', '3Y Consistency'] if c in mdf.columns]
+            if cols_3y:
+                st.dataframe(mdf[cols_3y].style.format({c: '{:.2f}' for c in cols_3y if c != 'Fund Name'}).background_gradient(subset=['3Y Roll Ret %'] if '3Y Roll Ret %' in cols_3y else [], cmap='RdYlGn'), use_container_width=True, height=400)
+            st.markdown("#### 5-Year Rolling Returns")
+            cols_5y = [c for c in ['Fund Name', '5Y Roll Ret %', '5Y Beat %', '5Y Consistency'] if c in mdf.columns]
+            if cols_5y:
+                st.dataframe(mdf[cols_5y].dropna(subset=['5Y Roll Ret %'] if '5Y Roll Ret %' in cols_5y else []).style.format({c: '{:.2f}' for c in cols_5y if c != 'Fund Name'}).background_gradient(subset=['5Y Roll Ret %'] if '5Y Roll Ret %' in cols_5y else [], cmap='RdYlGn'), use_container_width=True, height=400)
+            else:
+                st.info("Not enough data for 5-year rolling returns (requires 5+ years of history).")
         st.download_button("📥 Download", mdf.to_csv(index=False), f"{category}_metrics.csv", key="dl_metrics")
     elif "Quarterly" in view:
         rdf = calculate_quarterly_ranks(nav_df, scheme_map)
