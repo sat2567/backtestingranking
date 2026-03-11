@@ -708,6 +708,32 @@ def render_explorer_tab():
     nav_df, scheme_map = load_fund_data_raw(category)
     benchmark = load_nifty_data()
     if nav_df is None: st.error("Could not load data."); return
+
+    # ── Date Range Filter ──────────────────────────────────────────────────
+    data_min = nav_df.index.min().date()
+    data_max = nav_df.index.max().date()
+    st.markdown("##### 📅 Custom Date Range")
+    dr1, dr2, dr3 = st.columns([2, 2, 1])
+    with dr1:
+        start_date = st.date_input("From", value=data_min, min_value=data_min, max_value=data_max, key="exp_start")
+    with dr2:
+        end_date = st.date_input("To", value=data_max, min_value=data_min, max_value=data_max, key="exp_end")
+    with dr3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("↺ Reset", key="exp_reset"):
+            start_date = data_min
+            end_date = data_max
+    if start_date >= end_date:
+        st.error("Start date must be before end date."); return
+    start_ts = pd.Timestamp(start_date)
+    end_ts   = pd.Timestamp(end_date)
+    nav_df   = nav_df[(nav_df.index >= start_ts) & (nav_df.index <= end_ts)]
+    if benchmark is not None:
+        benchmark = benchmark[(benchmark.index >= start_ts) & (benchmark.index <= end_ts)]
+    # Drop funds with fewer than 60 trading days in the selected window
+    nav_df = nav_df.loc[:, nav_df.notna().sum() >= 60]
+    # ──────────────────────────────────────────────────────────────────────
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Funds", len(nav_df.columns))
     c2.metric("Period", f"{nav_df.index.min().strftime('%Y-%m')} to {nav_df.index.max().strftime('%Y-%m')}")
