@@ -739,15 +739,15 @@ def render_explorer_tab():
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Alpha %'] if 'Alpha %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[5]:
             st.markdown("#### 1-Year Rolling Returns")
-            cols_1y = [c for c in ['Fund Name', '1Y Roll Ret %', '1Y Beat %', '1Y Consistency'] if c in mdf.columns]
+            cols_1y = [c for c in ['Fund Name', '1Y Roll Ret %'] if c in mdf.columns]
             if cols_1y:
                 st.dataframe(mdf[cols_1y].style.format({c: '{:.2f}' for c in cols_1y if c != 'Fund Name'}).background_gradient(subset=['1Y Roll Ret %'] if '1Y Roll Ret %' in cols_1y else [], cmap='RdYlGn'), use_container_width=True, height=400)
             st.markdown("#### 3-Year Rolling Returns")
-            cols_3y = [c for c in ['Fund Name', '3Y Roll Ret %', '3Y Beat %', '3Y Consistency'] if c in mdf.columns]
+            cols_3y = [c for c in ['Fund Name', '3Y Roll Ret %'] if c in mdf.columns]
             if cols_3y:
                 st.dataframe(mdf[cols_3y].style.format({c: '{:.2f}' for c in cols_3y if c != 'Fund Name'}).background_gradient(subset=['3Y Roll Ret %'] if '3Y Roll Ret %' in cols_3y else [], cmap='RdYlGn'), use_container_width=True, height=400)
             st.markdown("#### 5-Year Rolling Returns")
-            cols_5y = [c for c in ['Fund Name', '5Y Roll Ret %', '5Y Beat %', '5Y Consistency'] if c in mdf.columns]
+            cols_5y = [c for c in ['Fund Name', '5Y Roll Ret %'] if c in mdf.columns]
             if cols_5y:
                 st.dataframe(mdf[cols_5y].dropna(subset=['5Y Roll Ret %'] if '5Y Roll Ret %' in cols_5y else []).style.format({c: '{:.2f}' for c in cols_5y if c != 'Fund Name'}).background_gradient(subset=['5Y Roll Ret %'] if '5Y Roll Ret %' in cols_5y else [], cmap='RdYlGn'), use_container_width=True, height=400)
             else:
