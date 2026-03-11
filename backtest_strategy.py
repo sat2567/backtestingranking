@@ -405,8 +405,11 @@ def calculate_comprehensive_metrics(nav_df, scheme_map, benchmark):
         else:
             mnths = int(round(active_years * 12))
             history_str = f"{mnths}M"
-        row = {'Fund Name': scheme_map.get(col, col), 'fund_id': col, 'Days': len(s),
-               'Active Since': active_since.strftime('%b %Y'), 'History': history_str}
+        short_history = active_years < 3
+        fund_display_name = ('⚠️ ' + scheme_map.get(col, col)) if short_history else scheme_map.get(col, col)
+        row = {'Fund Name': fund_display_name, 'fund_id': col, 'Days': len(s),
+               'Active Since': active_since.strftime('%b %Y'), 'History': history_str,
+               'Short History': short_history, 'Years Active': round(active_years, 1)}
         if len(s) >= 63: row['Return 3M %'] = (s.iloc[-1] / s.iloc[-63] - 1) * 100
         if len(s) >= 126: row['Return 6M %'] = (s.iloc[-1] / s.iloc[-126] - 1) * 100
         if len(s) >= 252: row['Return 1Y %'] = (s.iloc[-1] / s.iloc[-252] - 1) * 100
@@ -747,27 +750,44 @@ def render_explorer_tab():
         mdf = calculate_comprehensive_metrics(nav_df, scheme_map, benchmark)
         if mdf.empty: st.warning("No data."); return
         tabs = st.tabs(["🏆 Rankings", "📈 Returns", "⚠️ Risk", "⚖️ Risk-Adjusted", "🎯 Benchmark", "🔄 Rolling"])
+        # Short history warning banner (shown on every tab)
+        short_funds = mdf[mdf['Short History'] == True]['Fund Name'].tolist() if 'Short History' in mdf.columns else []
+        if short_funds:
+            names_str = ', '.join([n.replace('⚠️ ', '') for n in short_funds])
+            st.warning(f"⚠️ **{len(short_funds)} fund(s) have less than 3 years of history** — metrics may be unreliable due to limited data (no full market cycle): {names_str}")
+
+        def highlight_short_history(row):
+            if str(row.get('Fund Name', '')).startswith('⚠️'):
+                return ['background-color: #fff8e1; color: #e65100'] * len(row)
+            return [''] * len(row)
+
         with tabs[0]:
-            cols = [c for c in ['Fund Name', 'Active Since', 'History', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
+            cols = [c for c in ['Fund Name', 'Active Since', 'History', 'Years Active', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
             fmt = {c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Active Since', 'History')}
-            st.dataframe(mdf[cols].head(25).style.format(fmt).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
+            styled = mdf[cols].head(25).style.format(fmt)                .apply(highlight_short_history, axis=1)                .background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r')
+            st.dataframe(styled, use_container_width=True, height=600)
         with tabs[1]:
-            cols = [c for c in ['Fund Name', 'Return 3M %', 'Return 6M %', 'Return 1Y %', 'Return 3Y % (Ann)', 'CAGR %'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Return 1Y %'] if 'Return 1Y %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'History', 'Return 3M %', 'Return 6M %', 'Return 1Y %', 'Return 3Y % (Ann)', 'CAGR %'] if c in mdf.columns]
+            styled = mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'History')})                .apply(highlight_short_history, axis=1)                .background_gradient(subset=['Return 1Y %'] if 'Return 1Y %' in cols else [], cmap='RdYlGn')
+            st.dataframe(styled, use_container_width=True, height=600)
         with tabs[2]:
-            cols = [c for c in ['Fund Name', 'Volatility %', 'Max DD %'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'History', 'Volatility %', 'Max DD %'] if c in mdf.columns]
+            styled = mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'History')})                .apply(highlight_short_history, axis=1)                .background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn')
+            st.dataframe(styled, use_container_width=True, height=600)
         with tabs[3]:
-            cols = [c for c in ['Fund Name', 'Sharpe', 'Sortino', 'Calmar'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Sharpe'] if 'Sharpe' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'History', 'Sharpe', 'Sortino', 'Calmar'] if c in mdf.columns]
+            styled = mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'History')})                .apply(highlight_short_history, axis=1)                .background_gradient(subset=['Sharpe'] if 'Sharpe' in cols else [], cmap='RdYlGn')
+            st.dataframe(styled, use_container_width=True, height=600)
         with tabs[4]:
-            cols = [c for c in ['Fund Name', 'Beta', 'Alpha %', 'Up Cap %', 'Down Cap %', 'Cap Ratio'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Alpha %'] if 'Alpha %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'History', 'Beta', 'Alpha %', 'Up Cap %', 'Down Cap %', 'Cap Ratio'] if c in mdf.columns]
+            styled = mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'History')})                .apply(highlight_short_history, axis=1)                .background_gradient(subset=['Alpha %'] if 'Alpha %' in cols else [], cmap='RdYlGn')
+            st.dataframe(styled, use_container_width=True, height=600)
         with tabs[5]:
-            roll_cols = [c for c in ['Fund Name', '1Y Roll Ret %', '3Y Roll Ret %', '5Y Roll Ret %'] if c in mdf.columns]
-            fmt = {c: '{:.2f}' for c in roll_cols if c != 'Fund Name'}
+            roll_cols = [c for c in ['Fund Name', 'History', '1Y Roll Ret %', '3Y Roll Ret %', '5Y Roll Ret %'] if c in mdf.columns]
+            fmt = {c: '{:.2f}' for c in roll_cols if c not in ('Fund Name', 'History')}
             grad_col = next((c for c in ['1Y Roll Ret %', '3Y Roll Ret %', '5Y Roll Ret %'] if c in roll_cols), None)
-            st.dataframe(mdf[roll_cols].style.format(fmt).background_gradient(subset=[grad_col] if grad_col else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            styled = mdf[roll_cols].style.format(fmt)                .apply(highlight_short_history, axis=1)                .background_gradient(subset=[grad_col] if grad_col else [], cmap='RdYlGn')
+            st.dataframe(styled, use_container_width=True, height=600)
         st.download_button("📥 Download", mdf.to_csv(index=False), f"{category}_metrics.csv", key="dl_metrics")
     elif "Quarterly" in view:
         rdf = calculate_quarterly_ranks(nav_df, scheme_map)
