@@ -175,16 +175,15 @@ STRATEGY_DEFINITIONS = {
         'weaknesses': ['Ignores turnaround stories']
     },
     'smart_ensemble': {
-        'name': '🧠 Smart Ensemble (NEW)', 'short_desc': 'Meta-strategy: multi-strategy voting + trend + drawdown filter.',
+        'name': '🧠 Smart Ensemble', 'short_desc': 'Meta-strategy: multi-strategy voting ranked by vol-adjusted momentum.',
         'how_it_works': [
             'Run all 7 base strategies, collect Top N picks each.',
-            'Count votes: funds picked by 3+ strategies get priority.',
-            'Trend Filter: NAV must be above 50-day MA.',
-            'Drawdown Filter: exclude funds in >10% current drawdown.',
-            'Rank by vote count, then vol-adjusted momentum.'
+            'Count votes: funds picked by multiple strategies get priority.',
+            'Rank by vote count first, then by vol-adjusted momentum as tiebreaker.',
+            'Consensus-based: only funds with broad strategy agreement survive.'
         ],
-        'formula': 'Votes(7 strats) -> Trend(NAV>50DMA) -> DD(<10%) -> Rank', 'best_for': 'Maximum hit rate, all-weather.',
-        'weaknesses': ['Conservative, may miss early breakouts']
+        'formula': 'Votes(7 strats) -> Rank by votes desc, then Vol-Adj-Mom desc', 'best_for': 'Maximum conviction, all-weather.',
+        'weaknesses': ['Conservative, may miss early breakouts only one strategy catches']
     }
 }
 
@@ -321,6 +320,25 @@ def adaptive_momentum_weights(holding_days):
 # 6. DATA LOADING
 # ============================================================================
 
+def is_regular_growth_fund(name):
+    """Filter out non-regular-growth funds: IDCW, Dividend, Direct, Bonus, Institutional etc."""
+    n = str(name).lower()
+    exclude_keywords = [
+        'idcw', 'dividend', 'div ', 'div.', 'div)',
+        'direct', 'dir ', 'dir)',
+        'bonus',
+        'institutional',
+        'segregated',
+        'payout',
+        'reinvestment',
+        'monthly', 'quarterly', 'annual',
+        'option', 'opt',
+    ]
+    for kw in exclude_keywords:
+        if kw in n:
+            return False
+    return True
+
 @st.cache_data
 def load_fund_data_raw(category_key):
     filename = FILE_MAPPING.get(category_key)
@@ -336,8 +354,12 @@ def load_fund_data_raw(category_key):
         dates = pd.to_datetime(data_df.iloc[:, 0], errors='coerce')
         nav_wide = pd.DataFrame(index=dates)
         scheme_map = {}
+        skipped = 0
         for i, name in enumerate(fund_names):
             if pd.notna(name) and str(name).strip():
+                if not is_regular_growth_fund(name):
+                    skipped += 1
+                    continue
                 code = str(abs(hash(name)) % (10 ** 8))
                 scheme_map[code] = name
                 nav_wide[code] = pd.to_numeric(data_df.iloc[:, i+1], errors='coerce').values
@@ -495,9 +517,8 @@ def compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=5, holding_days=
         full_s = nav_df[fid].dropna()
         vam = calculate_vol_adjusted_momentum(full_s, w3, w6, w12) if len(full_s) >= 260 else 0
         candidates.append({**info, 'votes': data['votes'], 'strategies': data['strategies'],
-                           'trend_ok': check_trend_confirmation(full_s), 'dd_ok': check_drawdown_recency(full_s),
                            'vol_adj_mom': vam if not pd.isna(vam) else 0})
-    candidates.sort(key=lambda x: (-(1 if x['trend_ok'] else 0) - (1 if x['dd_ok'] else 0), -x['votes'], -x['vol_adj_mom']))
+    candidates.sort(key=lambda x: (-x['votes'], -x['vol_adj_mom']))
     return candidates[:top_n], vote_counts
 
 # ============================================================================
@@ -530,78 +551,143 @@ def create_drawdown_chart(series, name):
 # 9. EXPLORER TAB
 # ============================================================================
 
-def render_top5_panel(nav_df, scheme_map, benchmark):
-    top5 = calculate_comprehensive_metrics(nav_df, scheme_map, benchmark)
-    if top5.empty: return
-    top5 = top5.head(5)
-    regime, pct = get_current_regime(benchmark)
-    st.markdown("### 🏆 Top 5 Funds — Current Rankings")
-    rc = "#4caf50" if "🟢" in regime else "#f44336" if "🔴" in regime else "#ff9800"
-    st.markdown(f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;"><div style="background:{rc};color:white;padding:6px 16px;border-radius:20px;font-weight:700;font-size:0.9rem;">Market: {regime}</div><div style="color:#555;font-size:0.85rem;">Bench vs 200DMA: <strong>{pct:+.1f}%</strong></div></div>', unsafe_allow_html=True)
-    cols = st.columns(5)
-    for idx, (_, row) in enumerate(top5.iterrows()):
-        if idx >= 5: break
-        with cols[idx]:
-            st.markdown(f'<div class="top-fund-card"><div class="rank">#{idx+1}</div><div class="fund-name">{row["Fund Name"][:50]}</div></div>', unsafe_allow_html=True)
-
-def render_best_strategy_banner(nav_df, scheme_map, benchmark, top_n, target_n, hold):
-    with st.spinner("🔍 Finding best strategy..."):
-        results = []
-        all_strats = {'momentum': {'w_3m': 0.33, 'w_6m': 0.33, 'w_12m': 0.33, 'risk_adjust': True},
-                      'sharpe': {}, 'sortino': {}, 'regime_switch': {}, 'stable_momentum': {},
-                      'elimination': {}, 'consistency': {}, 'smart_ensemble': {}}
-        for key, cfg in all_strats.items():
-            h, e, b, _ = run_backtest(nav_df, key, top_n, target_n, hold, cfg, benchmark, scheme_map)
-            if not e.empty:
-                yrs = (e.iloc[-1]['date'] - e.iloc[0]['date']).days / 365.25
-                cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
-                bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
-                results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': (cagr - bcagr) * 100, 'cfg': cfg})
-    if not results: return
-    results.sort(key=lambda x: x['alpha'], reverse=True)
+def find_best_strategy(nav_df, scheme_map, benchmark, top_n, target_n, hold, optimize_by='alpha'):
+    """Find best strategy by chosen criteria. Single source of truth.
+    optimize_by: 'alpha', 'hit_rate', or 'balanced'
+    """
+    all_strats = {
+        'momentum': {'w_3m': 0.33, 'w_6m': 0.33, 'w_12m': 0.33, 'risk_adjust': True},
+        'sharpe': {}, 'sortino': {}, 'regime_switch': {}, 'stable_momentum': {},
+        'elimination': {}, 'consistency': {}, 'smart_ensemble': {}
+    }
+    results = []
+    for key, cfg in all_strats.items():
+        h, e, b, _ = run_backtest(nav_df, key, top_n, target_n, hold, cfg, benchmark, scheme_map)
+        if not e.empty:
+            yrs = (e.iloc[-1]['date'] - e.iloc[0]['date']).days / 365.25
+            cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
+            bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1 if yrs > 0 else 0
+            alpha = (cagr - bcagr) * 100
+            hr = h['hit_rate'].mean() * 100 if 'hit_rate' in h.columns and len(h) > 0 else 0
+            results.append({'key': key, 'name': STRATEGY_DEFINITIONS[key]['name'], 'alpha': alpha, 'hit_rate': hr, 'cfg': cfg})
+    if not results:
+        return None, []
+    if optimize_by == 'hit_rate':
+        results.sort(key=lambda x: x['hit_rate'], reverse=True)
+    elif optimize_by == 'balanced':
+        max_alpha = max(r['alpha'] for r in results) or 1
+        min_alpha = min(r['alpha'] for r in results)
+        alpha_range = max_alpha - min_alpha if max_alpha != min_alpha else 1
+        max_hr = max(r['hit_rate'] for r in results) or 1
+        min_hr = min(r['hit_rate'] for r in results)
+        hr_range = max_hr - min_hr if max_hr != min_hr else 1
+        for r in results:
+            r['balanced_score'] = 0.5 * ((r['alpha'] - min_alpha) / alpha_range) + 0.5 * ((r['hit_rate'] - min_hr) / hr_range)
+        results.sort(key=lambda x: x['balanced_score'], reverse=True)
+    else:
+        results.sort(key=lambda x: x['alpha'], reverse=True)
     best = results[0]
-    # Get current fund picks for the best strategy
-    best_picks = compute_current_strategy_picks(nav_df, scheme_map, benchmark, best['key'], top_n=top_n, holding_days=hold)
-    picks_html = ''.join([f'<div style="display:inline-block;background:rgba(255,255,255,0.15);padding:4px 12px;border-radius:8px;margin:3px 4px;font-size:0.82rem;">{p["name"][:40]}</div>' for p in best_picks])
-    st.markdown(f"""<div class="best-strat-banner">
-        <h3>🏅 Recommended: {best['name']}</h3>
-        <p>Highest Alpha for {get_holding_label(hold)} — <strong>{best['alpha']:+.1f}% alpha</strong> over benchmark</p>
-        <div style="margin-top:12px;"><span style="font-size:0.78rem;opacity:0.8;">Current Picks:</span><br>{picks_html}</div>
-    </div>""", unsafe_allow_html=True)
-    with st.expander("📊 All Strategy Rankings", expanded=False):
-        df = pd.DataFrame(results)[['name', 'alpha']].rename(columns={'name': 'Strategy', 'alpha': 'Alpha %'})
-        st.dataframe(df.style.format({'Alpha %': '{:+.2f}'}).background_gradient(subset=['Alpha %'], cmap='RdYlGn'), use_container_width=True)
+    if best['key'] == 'smart_ensemble':
+        picks_raw, _ = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
+        best_picks = [{'fund_id': p['fund_id'], 'name': p['name']} for p in picks_raw]
+    else:
+        picks_raw = compute_current_strategy_picks(nav_df, scheme_map, benchmark, best['key'], top_n=top_n, holding_days=hold)
+        best_picks = [{'fund_id': p['fund_id'], 'name': p['name']} for p in picks_raw]
+    return {'best': best, 'all_results': results, 'picks': best_picks}, best_picks
 
-def render_current_picks_panel(nav_df, scheme_map, benchmark, top_n, hold):
-    st.markdown("### 🧠 Smart Ensemble — Current Picks (Buy Today)")
-    picks, vote_counts = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
-    if not picks: st.warning("Not enough data."); return
-    # Run ensemble backtest to get the actual strategy alpha
-    h, e, b, _ = run_backtest(nav_df, 'smart_ensemble', top_n, 5, hold, {}, benchmark, scheme_map)
-    strat_alpha_str = "N/A"
-    strat_alpha_color = "#999"
-    if not e.empty:
-        yrs = (e.iloc[-1]['date'] - e.iloc[0]['date']).days / 365.25
-        if yrs > 0:
-            cagr = (e.iloc[-1]['value'] / 100) ** (1 / yrs) - 1
-            bcagr = (b.iloc[-1]['value'] / 100) ** (1 / yrs) - 1
-            strat_alpha = (cagr - bcagr) * 100
-            strat_alpha_str = f"{strat_alpha:+.1f}%"
-            strat_alpha_color = "#4caf50" if strat_alpha >= 0 else "#f44336"
-    st.markdown(f'<div style="background:linear-gradient(135deg,#e8f5e9,#f1f8e9);border-radius:12px;padding:14px 18px;margin-bottom:12px;border:1px solid #c8e6c9;"><span style="font-size:0.85rem;color:#555;">Strategy Backtested Alpha (annualized):</span> <strong style="font-size:1.1rem;color:{strat_alpha_color}">{strat_alpha_str}</strong></div>', unsafe_allow_html=True)
-    cols = st.columns(min(len(picks), 5))
-    for idx, pick in enumerate(picks):
-        with cols[idx % len(cols)]:
-            st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:50]}</div></div>', unsafe_allow_html=True)
+def render_unified_dashboard(nav_df, scheme_map, benchmark, top_n, hold, optimize_by='alpha'):
+    """Single unified dashboard: best strategy → its picks → ensemble comparison."""
+
+    with st.spinner("🔍 Analyzing all strategies to find the best..."):
+        result, best_picks = find_best_strategy(nav_df, scheme_map, benchmark, top_n, top_n + 3, hold, optimize_by)
+
+    if result is None:
+        st.warning("Not enough data to run strategies.")
+        return
+
+    best = result['best']
+    all_results = result['all_results']
+
+    opt_labels = {'alpha': 'Highest Alpha', 'hit_rate': 'Highest Hit Rate', 'balanced': 'Balanced (Alpha + Hit Rate)'}
+    opt_label = opt_labels.get(optimize_by, 'Highest Alpha')
+
+    # === SECTION 1: Best Strategy Banner + Its Fund Picks ===
+    best_key = best['key']
+    best_def = STRATEGY_DEFINITIONS[best_key]
+    alpha_str = f"{best['alpha']:+.1f}%"
+    hr_str = f"{best['hit_rate']:.0f}%"
+    target_display = top_n + 3
+    st.markdown(f"""<div class="best-strat-banner">
+        <h3>🏅 Best Strategy: {best['name']}</h3>
+        <p>Selected by: <strong>{opt_label}</strong> for {get_holding_label(hold)} holding • {top_n} picks</p>
+        <div class="strat-metrics">
+            <div class="strat-metric"><div class="val">{alpha_str}</div><div class="lbl">Alpha</div></div>
+            <div class="strat-metric"><div class="val">{hr_str}</div><div class="lbl">Hit Rate</div></div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown(f"""<div class="strategy-box">
+        <h4>How {best['name']} Works</h4>
+        <p><strong>Summary:</strong> {best_def['short_desc']}</p>
+        <p><strong>Steps:</strong></p>
+        <p>{'<br>'.join([f'{i+1}. {step}' for i, step in enumerate(best_def['how_it_works'])])}</p>
+        <p><strong>Formula:</strong> <code>{best_def['formula']}</code></p>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown(f"### 🏆 Top {top_n} Funds to Buy Today — via {best['name']}")
+    if best_picks:
+        cols = st.columns(min(len(best_picks), 5))
+        for idx, pick in enumerate(best_picks):
+            with cols[idx % len(cols)]:
+                st.markdown(f'<div class="top-fund-card"><div class="rank">#{idx+1}</div><div class="fund-name">{pick["name"][:50]}</div></div>', unsafe_allow_html=True)
+    else:
+        st.info("No picks available for this configuration.")
+
+    st.divider()
+
+    # === SECTION 2: Smart Ensemble Picks (for comparison) ===
+    st.markdown("### 🧠 Smart Ensemble Picks (for comparison)")
+    ensemble_result = None
+    for r in all_results:
+        if r['key'] == 'smart_ensemble':
+            ensemble_result = r
+            break
+    ensemble_alpha_str = f"{ensemble_result['alpha']:+.1f}%" if ensemble_result else "N/A"
+    ensemble_alpha_color = "#4caf50" if ensemble_result and ensemble_result['alpha'] >= 0 else "#f44336"
+
+    ensemble_picks_raw, _ = compute_ensemble_picks(nav_df, scheme_map, benchmark, top_n=top_n, holding_days=hold)
+    ensemble_picks = [{'fund_id': p['fund_id'], 'name': p['name']} for p in ensemble_picks_raw]
+
+    st.markdown(f'<div style="background:linear-gradient(135deg,#e8f5e9,#f1f8e9);border-radius:12px;padding:14px 18px;margin-bottom:12px;border:1px solid #c8e6c9;"><span style="font-size:0.85rem;color:#555;">Ensemble Backtested Alpha:</span> <strong style="font-size:1.1rem;color:{ensemble_alpha_color}">{ensemble_alpha_str}</strong></div>', unsafe_allow_html=True)
+
+    if ensemble_picks:
+        cols = st.columns(min(len(ensemble_picks), 5))
+        for idx, pick in enumerate(ensemble_picks):
+            with cols[idx % len(cols)]:
+                st.markdown(f'<div class="current-pick"><div class="pick-name">{pick["name"][:50]}</div></div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # === SECTION 3: All Strategies Ranked ===
+    with st.expander("📊 All Strategy Rankings", expanded=False):
+        df = pd.DataFrame(all_results)[['name', 'alpha', 'hit_rate']].rename(columns={'name': 'Strategy', 'alpha': 'Alpha %', 'hit_rate': 'Hit Rate %'})
+        sort_col = 'Alpha %' if optimize_by == 'alpha' else 'Hit Rate %' if optimize_by == 'hit_rate' else 'Alpha %'
+        st.dataframe(df.style.format({'Alpha %': '{:+.2f}', 'Hit Rate %': '{:.1f}'}).background_gradient(subset=[sort_col], cmap='RdYlGn'), use_container_width=True)
+
+    # === SECTION 4: Performance chart of best strategy picks ===
+    pick_ids = [p['fund_id'] for p in best_picks if p['fund_id'] in nav_df.columns]
+    if pick_ids:
+        st.plotly_chart(create_performance_chart(nav_df, pick_ids, scheme_map, benchmark), use_container_width=True, key="dash_perf")
 
 def render_explorer_tab():
     st.markdown('<div class="info-banner"><h2>📊 Category Explorer</h2><p>Comprehensive analysis with smart recommendations</p></div>', unsafe_allow_html=True)
     show_metric_definitions()
-    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 1, 1, 1.5])
     with c1: category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()))
     with c2: view = st.selectbox("👁️ View", ["🏆 Dashboard", "📈 Metrics", "📊 Quarterly Rankings", "🔍 Fund Deep Dive"])
     with c3: top_n_exp = st.number_input("Picks", 1, 10, 5, key="exp_topn")
     with c4: hold_exp = st.selectbox("Hold", HOLDING_PERIODS, index=1, format_func=get_holding_label, key="exp_hold")
+    with c5: optimize_by = st.selectbox("🎯 Optimize", ["Max Alpha", "Max Hit Rate", "Balanced"], key="exp_opt")
     nav_df, scheme_map = load_fund_data_raw(category)
     benchmark = load_nifty_data()
     if nav_df is None: st.error("Could not load data."); return
@@ -612,28 +698,21 @@ def render_explorer_tab():
     st.divider()
 
     if "Dashboard" in view:
-        render_top5_panel(nav_df, scheme_map, benchmark)
-        st.divider()
-        render_best_strategy_banner(nav_df, scheme_map, benchmark, top_n_exp, 5, hold_exp)
-        st.divider()
-        render_current_picks_panel(nav_df, scheme_map, benchmark, top_n_exp, hold_exp)
-        st.divider()
-        top5 = calculate_comprehensive_metrics(nav_df, scheme_map, benchmark).head(5)
-        if not top5.empty:
-            st.plotly_chart(create_performance_chart(nav_df, top5['fund_id'].tolist(), scheme_map, benchmark), use_container_width=True, key="dash_perf")
+        opt_map = {"Max Alpha": "alpha", "Max Hit Rate": "hit_rate", "Balanced": "balanced"}
+        render_unified_dashboard(nav_df, scheme_map, benchmark, top_n_exp, hold_exp, opt_map.get(optimize_by, "alpha"))
     elif "Metrics" in view:
         mdf = calculate_comprehensive_metrics(nav_df, scheme_map, benchmark)
         if mdf.empty: st.warning("No data."); return
         tabs = st.tabs(["🏆 Rankings", "📈 Returns", "⚠️ Risk", "⚖️ Risk-Adjusted", "🎯 Benchmark", "🔄 Rolling"])
         with tabs[0]:
-            cols = [c for c in ['Fund Name', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe', 'Trend OK', 'DD OK'] if c in mdf.columns]
-            st.dataframe(mdf[cols].head(25).style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Trend OK', 'DD OK')}).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'Composite Rank', 'CAGR Rank', 'Sharpe Rank', 'CAGR %', 'Sharpe'] if c in mdf.columns]
+            st.dataframe(mdf[cols].head(25).style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Composite Rank'] if 'Composite Rank' in cols else [], cmap='Greens_r'), use_container_width=True, height=600)
         with tabs[1]:
             cols = [c for c in ['Fund Name', 'Return 3M %', 'Return 6M %', 'Return 1Y %', 'Return 3Y % (Ann)', 'CAGR %'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Return 1Y %'] if 'Return 1Y %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[2]:
-            cols = [c for c in ['Fund Name', 'Volatility %', 'Max DD %', 'Trend OK', 'DD OK'] if c in mdf.columns]
-            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c not in ('Fund Name', 'Trend OK', 'DD OK')}).background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
+            cols = [c for c in ['Fund Name', 'Volatility %', 'Max DD %'] if c in mdf.columns]
+            st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Max DD %'] if 'Max DD %' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
         with tabs[3]:
             cols = [c for c in ['Fund Name', 'Sharpe', 'Sortino', 'Calmar'] if c in mdf.columns]
             st.dataframe(mdf[cols].style.format({c: '{:.2f}' for c in cols if c != 'Fund Name'}).background_gradient(subset=['Sharpe'] if 'Sharpe' in cols else [], cmap='RdYlGn'), use_container_width=True, height=600)
@@ -755,7 +834,7 @@ def run_backtest(nav, strategy, top_n, target_n, hold_days, mom_cfg, bench, sche
             for sn, pks in base_picks.items():
                 for fid in pks: vm[fid] = vm.get(fid, 0) + 1
             cands = [(fid, vm[fid], scores.get(fid, {})) for fid in vm]
-            cands.sort(key=lambda x: (-((1 if x[2].get('trend_ok') else 0) + (1 if x[2].get('dd_ok') else 0)), -x[1], -(x[2].get('vol_adj_mom') or 0)))
+            cands.sort(key=lambda x: (-x[1], -(x[2].get('vol_adj_mom') or 0)))
             selected = [c[0] for c in cands[:top_n]]
         elif strategy == 'stable_momentum':
             pool = [f for f, _ in sorted(scores.items(), key=lambda x: (x[1]['score'], x[1]['sharpe'] or 0), reverse=True)[:top_n*2]]
@@ -801,7 +880,7 @@ def run_backtest(nav, strategy, top_n, target_n, hold_days, mom_cfg, bench, sche
         actual_top = [f for f, _ in sorted(valid.items(), key=lambda x: x[1], reverse=True)[:target_n]]
         sel_valid = [f for f in selected if f in valid]
         hits = len(set(sel_valid) & set(actual_top))
-        hr = min((hits / len(sel_valid) if sel_valid else 0) + 0.05, 1.0)
+        hr = hits / len(sel_valid) if sel_valid else 0
         pret = np.mean([valid[f] for f in sel_valid]) if sel_valid else 0
         bret = (bench.asof(exit_dt) / bench.asof(entry_dt) - 1) if bench is not None else 0
         cap *= (1 + pret); bcap *= (1 + bret)
