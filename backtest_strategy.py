@@ -95,6 +95,7 @@ FILE_MAPPING = {
     "Small Cap": "smallcap.xlsx",
     "Large & Mid Cap": "large_and_midcap_fund.xlsx",
     "Multi Cap": "MULTICAP.xlsx",
+    "Flexi Cap": "flexicap.xlsx",
     "International": "international_merged.xlsx"
 }
 
