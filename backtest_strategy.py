@@ -350,9 +350,19 @@ def load_fund_data_raw(category_key):
         df = pd.read_excel(path, header=None)
         fund_names = df.iloc[2, 1:].tolist()
         data_df = df.iloc[4:, :].copy()
-        if isinstance(data_df.iloc[-1, 0], str) and 'Accord' in str(data_df.iloc[-1, 0]):
-            data_df = data_df.iloc[:-1, :]
+        # Strip ALL trailing rows that are not valid dates
+        # (handles NaN rows and Accord footer that appear at end in some files)
+        while len(data_df) > 0:
+            last_val = data_df.iloc[-1, 0]
+            if pd.isna(pd.to_datetime(last_val, errors='coerce')):
+                data_df = data_df.iloc[:-1, :]
+            else:
+                break
         dates = pd.to_datetime(data_df.iloc[:, 0], errors='coerce')
+        # Drop any remaining NaT rows (extra safety)
+        valid_mask = dates.notna()
+        data_df = data_df[valid_mask.values]
+        dates = dates[valid_mask]
         nav_wide = pd.DataFrame(index=dates)
         scheme_map = {}
         skipped = 0
