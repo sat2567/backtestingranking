@@ -343,9 +343,13 @@ def is_regular_growth_fund(name):
 @st.cache_data
 def load_fund_data_raw(category_key):
     filename = FILE_MAPPING.get(category_key)
-    if not filename: return None, None
+    if not filename:
+        st.error(f"No filename mapped for category: {category_key}")
+        return None, None
     path = os.path.join(DATA_DIR, filename)
-    if not os.path.exists(path): return None, None
+    if not os.path.exists(path):
+        st.error(f"❌ File not found: {os.path.abspath(path)}  |  CWD: {os.getcwd()}  |  Files in data/: {os.listdir(DATA_DIR) if os.path.exists(DATA_DIR) else 'data/ folder missing!'}")
+        return None, None
     try:
         df = pd.read_excel(path, header=None)
         fund_names = df.iloc[2, 1:].tolist()
