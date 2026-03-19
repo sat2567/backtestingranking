@@ -1,4 +1,4 @@
-"""
+  """
 Fund Analysis Dashboard — Rolling Returns Focus
 ================================================
 Simple dashboard showing:
@@ -373,8 +373,16 @@ def main():
         st.warning("No funds have sufficient history.")
         return
  
-    # Add Nifty row at top for reference (using global stats)
-    nifty_row = {'Fund Name': '📊 Nifty 100 (Benchmark)', 'Since': '—', 'Years': '—'}
+    # --- THIS IS THE FIX FOR BENCHMARK SINCE/YEARS ---
+    if nifty is not None and len(nifty) > 0:
+        nifty_since = nifty.index.min().strftime('%b %Y')
+        nifty_years = round((nifty.index.max() - nifty.index.min()).days / 365.25, 1)
+    else:
+        nifty_since = '—'
+        nifty_years = '—'
+        
+    # Add Nifty row at top for reference (using global stats and calculated since/years)
+    nifty_row = {'Fund Name': '📊 Nifty 100 (Benchmark)', 'Since': nifty_since, 'Years': nifty_years}
     for label in ['1Y', '3Y', '5Y']:
         nifty_row[f'{label} Mean %']   = global_nifty_stats.get(label, {}).get('Mean',   np.nan)
         nifty_row[f'{label} Median %'] = global_nifty_stats.get(label, {}).get('Median', np.nan)
@@ -395,10 +403,9 @@ def main():
     fmt_cols = [c for c in display_df.columns if '%' in c]
     format_dict = {c: '{:.2f}' for c in fmt_cols}
  
-    # --- THIS IS THE FIX ---
     def color_row(row):
         if row.get('Fund Name', '').startswith('📊'):
-            # Added "color: #1E3A5F;" to explicitly force the text to be dark blue/black
+            # Keeps the text dark blue/black
             return ['background-color: #e8eaf6; color: #1E3A5F; font-weight: bold'] * len(row)
         return [''] * len(row)
  
