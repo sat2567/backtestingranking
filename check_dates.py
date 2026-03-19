@@ -303,7 +303,6 @@ def render_fund_cards(fund_row, nifty_stats):
     for period, color in periods:
         cols = st.columns([1, 1, 1, 1])
         
-        # Here is the specific column logic that caused your error
         with cols[0]:
             st.markdown(f"**{period} Rolling**", unsafe_allow_html=False)
  
@@ -320,7 +319,6 @@ def render_fund_cards(fund_row, nifty_stats):
             else:
                 sub_text = ''
  
-            # And the second column block
             with cols[i + 1]:
                 st.markdown(card(sl, val, sub_text, color), unsafe_allow_html=True)
  
@@ -397,9 +395,11 @@ def main():
     fmt_cols = [c for c in display_df.columns if '%' in c]
     format_dict = {c: '{:.2f}' for c in fmt_cols}
  
+    # --- THIS IS THE FIX ---
     def color_row(row):
         if row.get('Fund Name', '').startswith('📊'):
-            return ['background-color: #e8eaf6; font-weight: bold'] * len(row)
+            # Added "color: #1E3A5F;" to explicitly force the text to be dark blue/black
+            return ['background-color: #e8eaf6; color: #1E3A5F; font-weight: bold'] * len(row)
         return [''] * len(row)
  
     styled = (
