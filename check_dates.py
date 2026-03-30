@@ -3,8 +3,14 @@ Fund Analysis Dashboard — Rolling Returns Focus
 ================================================
 Simple dashboard showing:
   - Rolling 1Y / 3Y / 5Y: Mean, Median, Min returns per fund
-  - Fund vs Nifty 100 rolling return comparison chart
+  - Fund vs Benchmark rolling return comparison chart
   - Category selector, fund selector
+
+Benchmarks:
+  - Mid Cap       → Nifty Midcap 100
+  - Small Cap     → Nifty Smallcap 100
+  - All others    → Nifty 50
+
 Run: streamlit run check_dates.py
 """
 
@@ -75,6 +81,13 @@ FILE_MAPPING = {
     "International":   "international_merged.xlsx"
 }
 
+# ── Benchmark mapping: category → (filename, display name) ──────────────────
+BENCHMARK_MAPPING = {
+    "Mid Cap":   ("nifty_midcap100.xlsx",    "Nifty Midcap 100"),
+    "Small Cap": ("niftysmallcap100.xlsx",   "Nifty Smallcap 100"),
+}
+DEFAULT_BENCHMARK = ("nifty50.xlsx", "Nifty 50")
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
@@ -132,19 +145,35 @@ def load_fund_data(category_key):
         st.error(f"Error loading data: {e}")
         return None, None
 
+
 @st.cache_data
-def load_nifty_data():
-    path = os.path.join(DATA_DIR, "nifty100_data.csv")
-    if not os.path.exists(path): return None
+def load_benchmark_data(category_key):
+    """Load the appropriate benchmark index based on fund category.
+
+    Returns (Series, str) → (benchmark NAV series, display name).
+    """
+    bench_file, bench_name = BENCHMARK_MAPPING.get(category_key, DEFAULT_BENCHMARK)
+    path = os.path.join(DATA_DIR, bench_file)
+
+    if not os.path.exists(path):
+        st.warning(f"⚠️ Benchmark file not found: {bench_file}")
+        return None, bench_name
+
     try:
-        df = pd.read_csv(path)
-        df.columns = [c.lower().strip() for c in df.columns]
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df['nav']  = pd.to_numeric(df['nav'], errors='coerce')
-        df = df.dropna(subset=['date','nav']).set_index('date').sort_index()
-        return clean_weekday_data(df).squeeze()
-    except:
-        return None
+        df = pd.read_excel(path, header=None)
+        # Rows 0-2 are headers; data starts at row 3
+        data_df = df.iloc[3:].copy()
+        data_df.columns = ['index_name', 'date', 'close']
+        data_df['date']  = pd.to_datetime(data_df['date'], errors='coerce')
+        data_df['close'] = pd.to_numeric(data_df['close'], errors='coerce')
+        data_df = data_df.dropna(subset=['date', 'close'])
+        data_df = data_df.set_index('date').sort_index()
+        series  = data_df['close']
+        series  = series[~series.index.duplicated(keep='last')]
+        return clean_weekday_data(pd.DataFrame({'nav': series})).squeeze(), bench_name
+    except Exception as e:
+        st.warning(f"⚠️ Error loading benchmark {bench_file}: {e}")
+        return None, bench_name
 
 # ============================================================================
 # ROLLING RETURN CALCULATION
@@ -217,13 +246,13 @@ def build_metrics_table(nav_pkl, scheme_map):
     return df
 
 # ============================================================================
-# COMPARISON CHART: fund rolling returns vs Nifty 100
+# COMPARISON CHART: fund rolling returns vs Benchmark
 # ============================================================================
-def comparison_chart(fund_series, nifty_series, fund_name, window, period_label):
-    """Plot rolling return time series for fund vs Nifty 100."""
+def comparison_chart(fund_series, bench_series, fund_name, bench_name, window, period_label):
+    """Plot rolling return time series for fund vs benchmark."""
     f_roll = rolling_returns(fund_series, window)
-    if nifty_series is not None:
-        b_roll = rolling_returns(nifty_series, window)
+    if bench_series is not None:
+        b_roll = rolling_returns(bench_series, window)
         common = f_roll.index.intersection(b_roll.index)
     else:
         common = f_roll.index
@@ -243,13 +272,13 @@ def comparison_chart(fund_series, nifty_series, fund_name, window, period_label)
     ))
 
     # Benchmark line
-    if nifty_series is not None and len(common) > 0:
+    if bench_series is not None and len(common) > 0:
         fig.add_trace(go.Scatter(
             x=common,
             y=(b_roll.loc[common] * 100).round(2),
-            name='Nifty 100',
+            name=bench_name,
             line=dict(color='#FF7043', width=2, dash='dot'),
-            hovertemplate='Nifty %{x|%b %Y}: %{y:.2f}%<extra></extra>'
+            hovertemplate=f'{bench_name} %{{x|%b %Y}}: %{{y:.2f}}%<extra></extra>'
         ))
 
     # Zero line
@@ -269,7 +298,7 @@ def comparison_chart(fund_series, nifty_series, fund_name, window, period_label)
 # ============================================================================
 # SUMMARY METRIC CARDS (for selected fund)
 # ============================================================================
-def render_fund_cards(fund_row, nifty_stats):
+def render_fund_cards(fund_row, bench_stats, bench_name):
     """Show mean/median/min cards for 1Y, 3Y, 5Y side by side."""
 
     def card(label, val, sub='', color='#2196F3'):
@@ -293,29 +322,27 @@ def render_fund_cards(fund_row, nifty_stats):
     stat_keys = ['Mean %', 'Median %', 'Min %']
     stat_labels = ['Mean', 'Median', 'Worst (Min)']
 
-    # Nifty reference row
-    nifty_ref = {
-        '1Y': nifty_stats.get('1Y', {}),
-        '3Y': nifty_stats.get('3Y', {}),
-        '5Y': nifty_stats.get('5Y', {}),
+    bench_ref = {
+        '1Y': bench_stats.get('1Y', {}),
+        '3Y': bench_stats.get('3Y', {}),
+        '5Y': bench_stats.get('5Y', {}),
     }
 
     for period, color in periods:
         cols = st.columns([1, 1, 1, 1])
-        
+
         with cols[0]:
             st.markdown(f"**{period} Rolling**", unsafe_allow_html=False)
 
         for i, (sk, sl) in enumerate(zip(stat_keys, stat_labels)):
             key = f"{period} {sk}"
             val  = get(fund_row, key)
-            nval = nifty_ref[period].get(sk.replace(' %', ''), np.nan)
+            nval = bench_ref[period].get(sk.replace(' %', ''), np.nan)
 
-            # sub-text: vs Nifty
             if not np.isnan(val) and not np.isnan(nval):
                 diff = val - nval
                 sign = '+' if diff >= 0 else ''
-                sub_text = f"vs Nifty {sign}{diff:.2f}%"
+                sub_text = f"vs {bench_name} {sign}{diff:.2f}%"
             else:
                 sub_text = ''
 
@@ -328,7 +355,7 @@ def render_fund_cards(fund_row, nifty_stats):
 # ============================================================================
 def main():
     st.markdown("## 📈 Fund Rolling Returns Dashboard")
-    st.caption("Rolling 1Y / 3Y / 5Y returns — Mean, Median, Min | vs Nifty 100 | 260 trading days/year")
+    st.caption("Rolling 1Y / 3Y / 5Y returns — Mean, Median, Min | vs Category Benchmark | 260 trading days/year")
 
     # ── Controls ─────────────────────────────────────────────────────────────
     c1, c2 = st.columns([2, 3])
@@ -337,11 +364,14 @@ def main():
 
     # Load data
     nav_df, scheme_map = load_fund_data(category)
-    nifty              = load_nifty_data()
+    benchmark, bench_name = load_benchmark_data(category)
 
     if nav_df is None:
         st.error("Could not load fund data.")
         return
+
+    # Show which benchmark is in use
+    st.info(f"📊 Benchmark for **{category}**: **{bench_name}**")
 
     # Fund selector
     fund_options = {scheme_map.get(c, c): c for c in nav_df.columns}
@@ -353,13 +383,13 @@ def main():
 
     st.divider()
 
-    # ── Compute GLOBAL Nifty stats for the summary table ──────────────────────
-    global_nifty_stats = {}
-    if nifty is not None:
+    # ── Compute GLOBAL benchmark stats for the summary table ──────────────────
+    global_bench_stats = {}
+    if benchmark is not None:
         for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
-            r = rolling_returns(nifty, window)
+            r = rolling_returns(benchmark, window)
             if len(r) > 0:
-                global_nifty_stats[label] = {
+                global_bench_stats[label] = {
                     'Mean':   r.mean() * 100,
                     'Median': r.median() * 100,
                     'Min':    r.min() * 100,
@@ -373,22 +403,22 @@ def main():
         st.warning("No funds have sufficient history.")
         return
 
-    # --- THIS IS THE FIX FOR BENCHMARK SINCE/YEARS ---
-    if nifty is not None and len(nifty) > 0:
-        nifty_since = nifty.index.min().strftime('%b %Y')
-        nifty_years = round((nifty.index.max() - nifty.index.min()).days / 365.25, 1)
+    # Benchmark since/years
+    if benchmark is not None and len(benchmark) > 0:
+        bench_since = benchmark.index.min().strftime('%b %Y')
+        bench_years = round((benchmark.index.max() - benchmark.index.min()).days / 365.25, 1)
     else:
-        nifty_since = '—'
-        nifty_years = '—'
-        
-    # Add Nifty row at top for reference (using global stats and calculated since/years)
-    nifty_row = {'Fund Name': '📊 Nifty 100 (Benchmark)', 'Since': nifty_since, 'Years': nifty_years}
-    for label in ['1Y', '3Y', '5Y']:
-        nifty_row[f'{label} Mean %']   = global_nifty_stats.get(label, {}).get('Mean',   np.nan)
-        nifty_row[f'{label} Median %'] = global_nifty_stats.get(label, {}).get('Median', np.nan)
-        nifty_row[f'{label} Min %']    = global_nifty_stats.get(label, {}).get('Min',    np.nan)
+        bench_since = '—'
+        bench_years = '—'
 
-    display_df = pd.concat([pd.DataFrame([nifty_row]), mdf], ignore_index=True)
+    # Add benchmark row at top for reference
+    bench_row = {'Fund Name': f'📊 {bench_name} (Benchmark)', 'Since': bench_since, 'Years': bench_years}
+    for label in ['1Y', '3Y', '5Y']:
+        bench_row[f'{label} Mean %']   = global_bench_stats.get(label, {}).get('Mean',   np.nan)
+        bench_row[f'{label} Median %'] = global_bench_stats.get(label, {}).get('Median', np.nan)
+        bench_row[f'{label} Min %']    = global_bench_stats.get(label, {}).get('Min',    np.nan)
+
+    display_df = pd.concat([pd.DataFrame([bench_row]), mdf], ignore_index=True)
 
     # Warn about short-history funds
     short_funds = mdf[mdf['Years'] < 3]['Fund Name'].tolist() if 'Years' in mdf.columns else []
@@ -405,7 +435,6 @@ def main():
 
     def color_row(row):
         if row.get('Fund Name', '').startswith('📊'):
-            # Keeps the text dark blue/black
             return ['background-color: #e8eaf6; color: #1E3A5F; font-weight: bold'] * len(row)
         return [''] * len(row)
 
@@ -419,7 +448,7 @@ def main():
         )
     )
 
-    st.markdown("### 📋 All Funds — Rolling Return Summary")
+    st.markdown(f"### 📋 All Funds — Rolling Return Summary (vs {bench_name})")
     st.dataframe(styled, use_container_width=True, height=620)
 
     # Download
@@ -449,25 +478,24 @@ def main():
             return
         fund_row = fund_row_df.iloc[0].to_dict()
 
-        # ── Compute LOCAL Nifty stats (Apples-to-Apples Alignment) ────────────
-        local_nifty_stats = {}
-        if nifty is not None:
+        # ── Compute LOCAL benchmark stats (Apples-to-Apples Alignment) ────────
+        local_bench_stats = {}
+        if benchmark is not None:
             for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
                 f_roll = rolling_returns(fund_series, window)
-                b_roll = rolling_returns(nifty, window)
-                
-                # Intersect to get exact same dates
+                b_roll = rolling_returns(benchmark, window)
+
                 common_idx = f_roll.index.intersection(b_roll.index)
-                
+
                 if len(common_idx) > 0:
-                    local_nifty_stats[label] = {
+                    local_bench_stats[label] = {
                         'Mean':   b_roll.loc[common_idx].mean() * 100,
                         'Median': b_roll.loc[common_idx].median() * 100,
                         'Min':    b_roll.loc[common_idx].min() * 100,
                     }
 
         # Metric cards
-        render_fund_cards(fund_row, local_nifty_stats)
+        render_fund_cards(fund_row, local_bench_stats, bench_name)
 
         st.divider()
 
@@ -483,16 +511,14 @@ def main():
                 st.info(f"⚠️ {plabel} chart: insufficient history ({len(fund_series)} days, need {window + 10})")
                 continue
 
-            # Note: We pass the FULL 'nifty' series here, chart handles alignment
-            fig = comparison_chart(fund_series, nifty, selected_name, window, plabel)
+            fig = comparison_chart(fund_series, benchmark, selected_name, bench_name, window, plabel)
             if fig:
-                # Annotate with fund stats strictly over the shared timeframe
                 f_roll = rolling_returns(fund_series, window)
-                
-                if nifty is not None:
-                    b_roll = rolling_returns(nifty, window)
+
+                if benchmark is not None:
+                    b_roll = rolling_returns(benchmark, window)
                     common_idx = f_roll.index.intersection(b_roll.index)
-                    
+
                     if len(common_idx) > 0:
                         f_stats = f_roll.loc[common_idx] * 100
                         n_stats = b_roll.loc[common_idx] * 100
@@ -500,7 +526,7 @@ def main():
                             f"Fund (Aligned) — Mean: {f_stats.mean():.2f}%  |  "
                             f"Median: {f_stats.median():.2f}%  |  "
                             f"Min: {f_stats.min():.2f}%"
-                            f"     |     Nifty (Aligned) — Mean: {n_stats.mean():.2f}%  |  "
+                            f"     |     {bench_name} (Aligned) — Mean: {n_stats.mean():.2f}%  |  "
                             f"Median: {n_stats.median():.2f}%  |  "
                             f"Min: {n_stats.min():.2f}%"
                         )
@@ -510,11 +536,11 @@ def main():
                 else:
                     f_stats = f_roll * 100
                     ann_text = f"Fund — Mean: {f_stats.mean():.2f}% | Median: {f_stats.median():.2f}% | Min: {f_stats.min():.2f}%"
-                
+
                 st.caption(ann_text)
                 st.plotly_chart(fig, use_container_width=True, key=f"chart_{fund_id}_{plabel}")
             else:
-                st.info(f"No {plabel} chart — insufficient overlapping data with Nifty 100.")
+                st.info(f"No {plabel} chart — insufficient overlapping data with {bench_name}.")
 
 if __name__ == "__main__":
     main()
