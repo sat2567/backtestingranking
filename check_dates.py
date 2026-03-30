@@ -83,7 +83,7 @@ FILE_MAPPING = {
 
 # ── Benchmark mapping: category → (filename, display name) ──────────────────
 BENCHMARK_MAPPING = {
-    "Mid Cap":   ("nifty midcap100.xlsx",    "Nifty Midcap 100"),
+    "Mid Cap":   ("nifty_midcap100.xlsx",    "Nifty Midcap 100"),
     "Small Cap": ("niftysmallcap100.xlsx",   "Nifty Smallcap 100"),
 }
 DEFAULT_BENCHMARK = ("nifty50.xlsx", "Nifty 50")
