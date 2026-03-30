@@ -374,57 +374,96 @@ def render_fund_cards(fund_row, bench_stats, bench_name):
 
 
 # ============================================================================
-# MAIN APP
+# FUND DETAIL VIEW (cards + charts) — rendered at TOP when a fund is selected
 # ============================================================================
-def main():
-    st.markdown("## 📈 Fund Rolling Returns Dashboard")
-    st.caption("Rolling 1Y / 3Y / 5Y returns — Mean, Median, Min | vs Category Benchmark | 260 trading days/year")
-
-    # ── Controls ─────────────────────────────────────────────────────────────
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()))
-
-    # Load data
-    nav_df, scheme_map = load_fund_data(category)
-    benchmark, bench_name = load_benchmark_data(category)
-
-    if nav_df is None:
-        st.error("Could not load fund data.")
+def render_fund_detail(selected_name, fund_options, nav_df, mdf, benchmark, bench_name):
+    """Render the full fund detail section: metric cards + rolling charts."""
+    fund_id = fund_options.get(selected_name)
+    if fund_id is None:
+        st.warning("Fund not found.")
         return
 
-    # Show which benchmark is in use
-    st.info(f"📊 Benchmark for **{category}**: **{bench_name}**")
+    fund_series = nav_df[fund_id].dropna()
 
-    # Fund selector
-    fund_options = {scheme_map.get(c, c): c for c in nav_df.columns}
-    with c2:
-        selected_name = st.selectbox(
-            "🔍 Select Fund for Detail View",
-            ['— Show Summary Table Only —'] + sorted(fund_options.keys())
-        )
+    st.markdown(f"### 🔍 {selected_name}")
+
+    # Get this fund's row from mdf
+    fund_row_df = mdf[mdf['Fund Name'] == selected_name]
+    if fund_row_df.empty:
+        st.info("Insufficient history for this fund.")
+        return
+    fund_row = fund_row_df.iloc[0].to_dict()
+
+    # ── Compute LOCAL benchmark stats (Apples-to-Apples Alignment) ────────
+    local_bench_stats = {}
+    if benchmark is not None:
+        for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
+            f_roll = rolling_returns(fund_series, window)
+            b_roll = rolling_returns(benchmark, window)
+
+            common_idx = f_roll.index.intersection(b_roll.index)
+
+            if len(common_idx) > 0:
+                local_bench_stats[label] = {
+                    'Mean':   b_roll.loc[common_idx].mean() * 100,
+                    'Median': b_roll.loc[common_idx].median() * 100,
+                    'Min':    b_roll.loc[common_idx].min() * 100,
+                }
+
+    # Metric cards
+    render_fund_cards(fund_row, local_bench_stats, bench_name)
 
     st.divider()
 
-    # ── Compute GLOBAL benchmark stats for the summary table ──────────────────
-    global_bench_stats = {}
-    if benchmark is not None:
-        for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
-            r = rolling_returns(benchmark, window)
-            if len(r) > 0:
-                global_bench_stats[label] = {
-                    'Mean':   r.mean() * 100,
-                    'Median': r.median() * 100,
-                    'Min':    r.min() * 100,
-                }
+    # Rolling return charts for all three periods
+    periods = [
+        ('1Y Rolling Return', W1, '1Y'),
+        ('3Y Rolling Return', W3, '3Y'),
+        ('5Y Rolling Return', W5, '5Y'),
+    ]
 
-    # ── Summary Table ─────────────────────────────────────────────────────────
-    with st.spinner("Computing rolling returns for all funds..."):
-        mdf = build_metrics_table(nav_df, scheme_map)
+    for chart_title, window, plabel in periods:
+        if len(fund_series) < window + 10:
+            st.info(f"⚠️ {plabel} chart: insufficient history ({len(fund_series)} days, need {window + 10})")
+            continue
 
-    if mdf.empty:
-        st.warning("No funds have sufficient history.")
-        return
+        fig = comparison_chart(fund_series, benchmark, selected_name, bench_name, window, plabel)
+        if fig:
+            f_roll = rolling_returns(fund_series, window)
+
+            if benchmark is not None:
+                b_roll = rolling_returns(benchmark, window)
+                common_idx = f_roll.index.intersection(b_roll.index)
+
+                if len(common_idx) > 0:
+                    f_stats = f_roll.loc[common_idx] * 100
+                    n_stats = b_roll.loc[common_idx] * 100
+                    ann_text = (
+                        f"Fund (Aligned) — Mean: {f_stats.mean():.2f}%  |  "
+                        f"Median: {f_stats.median():.2f}%  |  "
+                        f"Min: {f_stats.min():.2f}%"
+                        f"     |     {bench_name} (Aligned) — Mean: {n_stats.mean():.2f}%  |  "
+                        f"Median: {n_stats.median():.2f}%  |  "
+                        f"Min: {n_stats.min():.2f}%"
+                    )
+                else:
+                    f_stats = f_roll * 100
+                    ann_text = f"Fund — Mean: {f_stats.mean():.2f}% | Median: {f_stats.median():.2f}% | Min: {f_stats.min():.2f}%"
+            else:
+                f_stats = f_roll * 100
+                ann_text = f"Fund — Mean: {f_stats.mean():.2f}% | Median: {f_stats.median():.2f}% | Min: {f_stats.min():.2f}%"
+
+            st.caption(ann_text)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_{fund_id}_{plabel}")
+        else:
+            st.info(f"No {plabel} chart — insufficient overlapping data with {bench_name}.")
+
+
+# ============================================================================
+# SUMMARY TABLE SECTION — rendered at BOTTOM
+# ============================================================================
+def render_summary_table(mdf, benchmark, bench_name, global_bench_stats, category):
+    """Render the full summary table section with benchmark row + download."""
 
     # Benchmark since/years
     if benchmark is not None and len(benchmark) > 0:
@@ -482,88 +521,70 @@ def main():
         key="dl_table"
     )
 
-    # ── Fund Detail View ──────────────────────────────────────────────────────
-    if selected_name != '— Show Summary Table Only —':
-        fund_id = fund_options.get(selected_name)
-        if fund_id is None:
-            st.warning("Fund not found.")
-            return
 
-        fund_series = nav_df[fund_id].dropna()
+# ============================================================================
+# MAIN APP
+# ============================================================================
+def main():
+    st.markdown("## 📈 Fund Rolling Returns Dashboard")
+    st.caption("Rolling 1Y / 3Y / 5Y returns — Mean, Median, Min | vs Category Benchmark | 260 trading days/year")
 
+    # ── Controls ─────────────────────────────────────────────────────────────
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        category = st.selectbox("📁 Category", list(FILE_MAPPING.keys()))
+
+    # Load data
+    nav_df, scheme_map = load_fund_data(category)
+    benchmark, bench_name = load_benchmark_data(category)
+
+    if nav_df is None:
+        st.error("Could not load fund data.")
+        return
+
+    # Show which benchmark is in use
+    st.info(f"📊 Benchmark for **{category}**: **{bench_name}**")
+
+    # Fund selector
+    fund_options = {scheme_map.get(c, c): c for c in nav_df.columns}
+    with c2:
+        selected_name = st.selectbox(
+            "🔍 Select Fund for Detail View",
+            ['— Show Summary Table Only —'] + sorted(fund_options.keys())
+        )
+
+    st.divider()
+
+    # ── Compute metrics (needed for both detail + table) ──────────────────────
+    global_bench_stats = {}
+    if benchmark is not None:
+        for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
+            r = rolling_returns(benchmark, window)
+            if len(r) > 0:
+                global_bench_stats[label] = {
+                    'Mean':   r.mean() * 100,
+                    'Median': r.median() * 100,
+                    'Min':    r.min() * 100,
+                }
+
+    with st.spinner("Computing rolling returns for all funds..."):
+        mdf = build_metrics_table(nav_df, scheme_map)
+
+    if mdf.empty:
+        st.warning("No funds have sufficient history.")
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYOUT ORDER: Fund Detail FIRST (at top), Summary Table SECOND (bottom)
+    # ══════════════════════════════════════════════════════════════════════════
+    fund_selected = selected_name != '— Show Summary Table Only —'
+
+    if fund_selected:
+        render_fund_detail(selected_name, fund_options, nav_df, mdf, benchmark, bench_name)
         st.divider()
-        st.markdown(f"### 🔍 {selected_name}")
 
-        # Get this fund's row from mdf
-        fund_row_df = mdf[mdf['Fund Name'] == selected_name]
-        if fund_row_df.empty:
-            st.info("Insufficient history for this fund.")
-            return
-        fund_row = fund_row_df.iloc[0].to_dict()
+    render_summary_table(mdf, benchmark, bench_name, global_bench_stats, category)
 
-        # ── Compute LOCAL benchmark stats (Apples-to-Apples Alignment) ────────
-        local_bench_stats = {}
-        if benchmark is not None:
-            for label, window in [('1Y', W1), ('3Y', W3), ('5Y', W5)]:
-                f_roll = rolling_returns(fund_series, window)
-                b_roll = rolling_returns(benchmark, window)
-
-                common_idx = f_roll.index.intersection(b_roll.index)
-
-                if len(common_idx) > 0:
-                    local_bench_stats[label] = {
-                        'Mean':   b_roll.loc[common_idx].mean() * 100,
-                        'Median': b_roll.loc[common_idx].median() * 100,
-                        'Min':    b_roll.loc[common_idx].min() * 100,
-                    }
-
-        # Metric cards
-        render_fund_cards(fund_row, local_bench_stats, bench_name)
-
-        st.divider()
-
-        # Rolling return charts for all three periods
-        periods = [
-            ('1Y Rolling Return', W1, '1Y'),
-            ('3Y Rolling Return', W3, '3Y'),
-            ('5Y Rolling Return', W5, '5Y'),
-        ]
-
-        for chart_title, window, plabel in periods:
-            if len(fund_series) < window + 10:
-                st.info(f"⚠️ {plabel} chart: insufficient history ({len(fund_series)} days, need {window + 10})")
-                continue
-
-            fig = comparison_chart(fund_series, benchmark, selected_name, bench_name, window, plabel)
-            if fig:
-                f_roll = rolling_returns(fund_series, window)
-
-                if benchmark is not None:
-                    b_roll = rolling_returns(benchmark, window)
-                    common_idx = f_roll.index.intersection(b_roll.index)
-
-                    if len(common_idx) > 0:
-                        f_stats = f_roll.loc[common_idx] * 100
-                        n_stats = b_roll.loc[common_idx] * 100
-                        ann_text = (
-                            f"Fund (Aligned) — Mean: {f_stats.mean():.2f}%  |  "
-                            f"Median: {f_stats.median():.2f}%  |  "
-                            f"Min: {f_stats.min():.2f}%"
-                            f"     |     {bench_name} (Aligned) — Mean: {n_stats.mean():.2f}%  |  "
-                            f"Median: {n_stats.median():.2f}%  |  "
-                            f"Min: {n_stats.min():.2f}%"
-                        )
-                    else:
-                        f_stats = f_roll * 100
-                        ann_text = f"Fund — Mean: {f_stats.mean():.2f}% | Median: {f_stats.median():.2f}% | Min: {f_stats.min():.2f}%"
-                else:
-                    f_stats = f_roll * 100
-                    ann_text = f"Fund — Mean: {f_stats.mean():.2f}% | Median: {f_stats.median():.2f}% | Min: {f_stats.min():.2f}%"
-
-                st.caption(ann_text)
-                st.plotly_chart(fig, use_container_width=True, key=f"chart_{fund_id}_{plabel}")
-            else:
-                st.info(f"No {plabel} chart — insufficient overlapping data with {bench_name}.")
 
 if __name__ == "__main__":
     main()
