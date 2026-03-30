@@ -88,6 +88,15 @@ BENCHMARK_MAPPING = {
 }
 DEFAULT_BENCHMARK = ("nifty50.xlsx", "Nifty 50")
 
+# Directories to search for benchmark files (in priority order)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BENCHMARK_SEARCH_PATHS = [
+    DATA_DIR,                              # data/
+    ".",                                   # current working directory
+    SCRIPT_DIR,                            # same folder as the script
+    os.path.join(SCRIPT_DIR, "data"),      # data/ relative to script
+]
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
@@ -150,13 +159,27 @@ def load_fund_data(category_key):
 def load_benchmark_data(category_key):
     """Load the appropriate benchmark index based on fund category.
 
+    Searches DATA_DIR, current directory, and script directory for the file.
     Returns (Series, str) → (benchmark NAV series, display name).
     """
     bench_file, bench_name = BENCHMARK_MAPPING.get(category_key, DEFAULT_BENCHMARK)
-    path = os.path.join(DATA_DIR, bench_file)
 
-    if not os.path.exists(path):
-        st.warning(f"⚠️ Benchmark file not found: {bench_file}")
+    # Search multiple directories for the benchmark file
+    path = None
+    for search_dir in BENCHMARK_SEARCH_PATHS:
+        candidate = os.path.join(search_dir, bench_file)
+        if os.path.exists(candidate):
+            path = candidate
+            break
+
+    if path is None:
+        searched = [os.path.abspath(d) for d in BENCHMARK_SEARCH_PATHS]
+        st.error(
+            f"❌ Benchmark file **{bench_file}** not found.\n\n"
+            f"Searched in:\n" +
+            "\n".join(f"- `{d}`" for d in searched) +
+            f"\n\nPlease place **{bench_file}** in one of these folders (recommended: `{os.path.abspath(DATA_DIR)}/`)."
+        )
         return None, bench_name
 
     try:
@@ -172,7 +195,7 @@ def load_benchmark_data(category_key):
         series  = series[~series.index.duplicated(keep='last')]
         return clean_weekday_data(pd.DataFrame({'nav': series})).squeeze(), bench_name
     except Exception as e:
-        st.warning(f"⚠️ Error loading benchmark {bench_file}: {e}")
+        st.error(f"❌ Error loading benchmark **{bench_file}** from `{path}`: {e}")
         return None, bench_name
 
 # ============================================================================
